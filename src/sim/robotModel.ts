@@ -91,15 +91,13 @@ export class SimRobot {
   private tween: Tween = { from: NEUTRAL, to: NEUTRAL, start: 0, dur: 0 };
   private action: RunningAction | null = null;
   private busyUntil: number | null = null;
-  private pending: RobotCommand | null = null;
   private joints: JointAngles[] = STANCE.map((f, i) => ikLeg(bodyToLeg(i, f))!);
 
   apply(cmd: RobotCommand, now: number): void {
     this.advanceTo(now);
-    if (this.busyUntil !== null) {
-      this.pending = cmd; // the firmware keeps only the latest message while an action blocks
-      return;
-    }
+    // The action blocks the firmware loop; when it returns, remote.ino clears its receive
+    // buffer (memset of ble_server.rec), so anything received meanwhile is discarded.
+    if (this.busyUntil !== null) return;
     this.handle(cmd, now);
   }
 
@@ -218,9 +216,6 @@ export class SimRobot {
       const end = this.busyUntil;
       this.integrate(end);
       this.finishAction();
-      const next = this.pending;
-      this.pending = null;
-      if (next) this.handle(next, end);
     }
     this.integrate(now);
   }

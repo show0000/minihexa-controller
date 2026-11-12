@@ -205,7 +205,7 @@ describe('SimRobot', () => {
       expect(f.odom).toEqual({ x: 0, y: 0, heading: 0 });
     });
 
-    it('holds commands while busy and applies only the last one when busy ends', () => {
+    it('discards commands received while busy (remote.ino clears its buffer after the action)', () => {
       const r = new SimRobot();
       r.tick(0);
       r.apply({ kind: 'action', id: 3 }, 0); // 2200ms
@@ -217,17 +217,21 @@ describe('SimRobot', () => {
       const y0 = during.odom.y;
       const after = runTo(r, 2199, 3200);
       expect(after.led).toEqual([0, 237, 178]);
-      expect(after.odom.y).toBeLessThan(y0 - 5);
+      expect(after.odom.y).toBeCloseTo(y0); // neither held move was applied
     });
 
-    it('a held command is applied at busy end even if apply is called later', () => {
+    it('a command sent after the action ends is applied', () => {
       const r = new SimRobot();
       r.tick(0);
       r.apply({ kind: 'action', id: 3 }, 0);
       r.apply({ kind: 'led', r: 9, g: 9, b: 9 }, 100);
       r.apply({ kind: 'led', r: 5, g: 5, b: 5 }, 5000);
-      // led 9 applied at 2200, then led 5 applied immediately at 5000
       expect(r.tick(5000).led).toEqual([5, 5, 5]);
+      const s2 = new SimRobot();
+      s2.tick(0);
+      s2.apply({ kind: 'action', id: 3 }, 0);
+      s2.apply({ kind: 'led', r: 9, g: 9, b: 9 }, 100);
+      expect(s2.tick(5000).led).toEqual([0, 237, 178]);
     });
 
     it('does not walk after an action until a new command arrives, but keeps the latched vel', () => {
