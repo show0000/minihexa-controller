@@ -150,7 +150,6 @@ export class Controller {
     if (this.moveLatched && commandsEqual(desiredMove, STOP)) this.moveLatched = false;
     const wantMove = this.moveLatched ? STOP : desiredMove;
     const wantStop = commandsEqual(wantMove, STOP);
-    if (!wantStop) this.stopRepeats = 0;
 
     // Safety: stop immediately, regardless of the rate limit.
     if (wantStop && !commandsEqual(this.lastMove, STOP)) return [this.emitStop(now)];
@@ -172,7 +171,9 @@ export class Controller {
       return [this.apply(intent, now)];
     }
 
-    if (this.stopRepeats > 0) {
+    // Repeats are cancelled only by a non-STOP move actually going out (below), not by input
+    // that never got a slot; while the stick is pushed, the move takes the slot instead.
+    if (this.stopRepeats > 0 && wantStop) {
       this.stopRepeats--;
       this.lastSlotAt = now;
       return [STOP];
@@ -186,6 +187,7 @@ export class Controller {
     const sendMove = movePending && (!posePending || this.lastSlotKind !== 'move');
     this.lastSlotAt = now;
     if (sendMove) {
+      if (!wantStop) this.stopRepeats = 0;
       this.lastMove = wantMove;
       this.lastSlotKind = 'move';
       return [wantMove];

@@ -451,6 +451,16 @@ describe('Controller: STOP slot occupancy and redundancy', () => {
     expect(out).toEqual([[60, move(0, 50)]]);
   });
 
+  it('a stick flick that is never sent does not cancel the STOP repeats', () => {
+    const c = mk();
+    c.update(-100, inp({ moveY: 1 }));
+    expect(c.update(0, N)).toEqual([STOP]);
+    expect(c.update(16, inp({ moveY: 1 }))).toEqual([]); // inside the STOP's slot: not sent
+    expect(c.update(33, N)).toEqual([]);
+    const out = run(c, 40, 600, N);
+    expect(out).toEqual([[50, STOP], [100, STOP]]);
+  });
+
   it('a queued intent takes priority over repeats and cancels them', () => {
     const c = mk();
     c.update(0, inp({ moveY: 1 }));
