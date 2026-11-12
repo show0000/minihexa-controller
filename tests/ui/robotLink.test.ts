@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { STOP, type RobotCommand } from '../../src/protocol/commands';
-import type { BleEvents } from '../../src/transport/ble';
+import { BleTransport, type BleEvents, type WritableChar } from '../../src/transport/ble';
 import { Fanout } from '../../src/transport/fanout';
 import { DISCONNECT_STOP_WAIT_MS, RobotLink, WALKING_WARNING, type RobotTransport } from '../../src/ui/robotLink';
 
@@ -14,6 +14,18 @@ class FakeTransport implements RobotTransport {
   send(c: RobotCommand): void {
     if (this.connected) this.sent.push(c);
   }
+  finalCalls = 0;
+  private finalResolve: ((ok: boolean) => void) | null = null;
+  finalStop(): Promise<boolean> {
+    this.finalCalls++;
+    return new Promise((r) => (this.finalResolve = r));
+  }
+  /** The final STOP's own write settles (reported like the real transport). */
+  confirmFinal(ok = true): void {
+    this.finalResolve?.(ok);
+    this.finalResolve = null;
+    this.ev.onWritten(STOP, ok);
+  }
   disconnect(): void {
     this.disconnectCalls++;
     this.drop();
@@ -22,6 +34,8 @@ class FakeTransport implements RobotTransport {
   drop(): void {
     if (!this.connected) return;
     this.connected = false;
+    this.finalResolve?.(false);
+    this.finalResolve = null;
     this.ev.onDisconnect();
   }
   written(c: RobotCommand, ok = true): void {
@@ -180,16 +194,18 @@ describe('RobotLink: walking belief follows written commands, not queued ones', 
 });
 
 describe('RobotLink: user disconnect waits for a confirmed STOP', () => {
-  it('detaches from the Fanout, sends a STOP and disconnects once it is written', async () => {
+  it('detaches from the Fanout, asks for the final STOP and disconnects only once that one is written', async () => {
     const { link, fanout, transport } = await connected();
     transport().written(STOP);
     transport().written(WALK);
     const done = link.disconnect();
     expect(link.state).toBe('disconnecting');
     expect(fanout.connected).toBe(false); // later controller output no longer reaches the robot
-    expect(transport().sent.at(-1)).toEqual(STOP);
+    expect(transport().finalCalls).toBe(1);
+    transport().written(STOP); // some earlier STOP: not the final one
+    await new Promise((r) => setTimeout(r, 0));
     expect(transport().disconnectCalls).toBe(0);
-    transport().written(STOP);
+    transport().confirmFinal();
     await done;
     expect(transport().disconnectCalls).toBe(1);
     expect(link.state).toBe('disconnected');
@@ -215,38 +231,19 @@ describe('RobotLink: user disconnect waits for a confirmed STOP', () => {
     const { link, transport } = await connected();
     transport().written(STOP);
     const done = link.disconnect();
-    transport().written(STOP, false);
+    transport().confirmFinal(false);
     await vi.advanceTimersByTimeAsync(DISCONNECT_STOP_WAIT_MS);
     await done;
     expect(link.warning).toBe(WALKING_WARNING);
-  });
-
-  it('a trailing STOP still in flight when the link closes does not raise a false warning', async () => {
-    const { link, transport } = await connected();
-    transport().written(WALK);
-    const done = link.disconnect();
-    // The controller's e-stop STOP is confirmed; the link's own STOP is now in flight and the
-    // real transport reports it unconfirmed when disconnect() closes the link.
-    const t = transport();
-    t.disconnect = () => {
-      t.disconnectCalls++;
-      t.ev.onWritten(STOP, false);
-      t.drop();
-    };
-    t.written(STOP);
-    await done;
-    expect(t.disconnectCalls).toBe(1);
-    expect(link.state).toBe('disconnected');
-    expect(link.warning).toBeNull();
   });
 
   it('a second disconnect while waiting is ignored', async () => {
     const { link, transport } = await connected();
     const a = link.disconnect();
     const b = link.disconnect();
-    transport().written(STOP);
+    transport().confirmFinal();
     await Promise.all([a, b]);
-    expect(transport().sent.filter((c) => c === STOP || c.kind === 'move')).toHaveLength(2); // resync + one
+    expect(transport().finalCalls).toBe(1);
     expect(transport().disconnectCalls).toBe(1);
   });
 
@@ -297,5 +294,100 @@ describe('RobotLink: connect failures', () => {
     await link.connect();
     expect(link.state).toBe('disconnected');
     expect(link.notice).toContain('Web Bluetooth');
+  });
+});
+
+/** A GATT characteristic whose writes settle only when the test says so. */
+function manualChar() {
+  const dec = new TextDecoder();
+  const writes: string[] = [];
+  const pending: Array<{ ok: () => void; fail: (e: unknown) => void }> = [];
+  const c: WritableChar = {
+    writeValueWithResponse(v) {
+      writes.push(dec.decode(v as Uint8Array));
+      return new Promise<void>((ok, fail) => pending.push({ ok, fail }));
+    },
+  };
+  const flush = () =>
+    vi.isFakeTimers() ? vi.advanceTimersByTimeAsync(0) : new Promise((r) => setTimeout(r, 0));
+  /** Settle the oldest unsettled write, then let the pump run. */
+  const settle = async (ok = true) => {
+    const w = pending.shift()!;
+    if (ok) w.ok();
+    else w.fail(new Error('gatt'));
+    await flush();
+  };
+  return { c, writes, settle, flush, inFlight: () => pending.length };
+}
+
+async function realLink() {
+  const ch = manualChar();
+  const fanout = new Fanout({ send: () => {}, connected: true });
+  let t: BleTransport | null = null;
+  const link = new RobotLink(fanout, () => fanout.send(STOP), {
+    connect: async (ev) => (t = new BleTransport(ch.c, ev)),
+    bluetoothAvailable: () => true,
+  });
+  await link.connect();
+  await ch.settle(); // resync STOP confirmed
+  return { link, fanout, ch, transport: () => t! };
+}
+
+describe('RobotLink + BleTransport: user disconnect race (real write pump)', () => {
+  it('a command pending behind an in-flight STOP (avoid on) is never written after the click', async () => {
+    const { link, fanout, ch, transport } = await realLink();
+    fanout.send(WALK);
+    await ch.settle(); // walking
+    // Controller: pre-intent STOP (in flight), then avoid on waiting behind it.
+    fanout.send(STOP);
+    fanout.send({ kind: 'avoid', on: true });
+    await ch.flush();
+    const clickAt = ch.writes.length;
+    fanout.send(STOP); // the controller's e-stop
+    const done = link.disconnect();
+    await ch.settle(); // the earlier STOP is confirmed: must NOT end the wait
+    expect(transport().connected).toBe(true);
+    expect(ch.writes.slice(clickAt)).toEqual(['C|0|0|0&']); // only the link's own final STOP
+    await ch.settle(); // the final STOP is confirmed
+    await done;
+    expect(ch.writes).not.toContain('I|1&');
+    expect(transport().connected).toBe(false);
+    expect(link.warning).toBeNull();
+  });
+
+  it('the wait ends only on the final STOP; if it fails, the warning is shown', async () => {
+    vi.useFakeTimers();
+    const { link, fanout, ch } = await realLink();
+    fanout.send(WALK);
+    await ch.settle();
+    const done = link.disconnect();
+    await ch.settle(false); // the final STOP failed
+    await vi.advanceTimersByTimeAsync(DISCONNECT_STOP_WAIT_MS);
+    await done;
+    expect(link.state).toBe('disconnected');
+    expect(link.warning).toBe(WALKING_WARNING);
+  });
+
+  it(`a final STOP not confirmed within ${DISCONNECT_STOP_WAIT_MS}ms shows the warning`, async () => {
+    vi.useFakeTimers();
+    const { link, ch } = await realLink();
+    const done = link.disconnect();
+    await vi.advanceTimersByTimeAsync(DISCONNECT_STOP_WAIT_MS);
+    await done;
+    expect(ch.inFlight()).toBe(1); // still unsettled
+    expect(link.state).toBe('disconnected');
+    expect(link.warning).toBe(WALKING_WARNING);
+  });
+
+  it('a walking command in flight at the click is followed by the final STOP; confirmed means no warning', async () => {
+    const { link, fanout, ch } = await realLink();
+    fanout.send({ kind: 'avoid', on: true });
+    await ch.flush();
+    const done = link.disconnect();
+    await ch.settle(); // avoid on written (it was handed to GATT before the click)
+    expect(link.robotMayWalk).toBe(true);
+    await ch.settle(); // final STOP written: STOP replaces avoid as the firmware's last command
+    await done;
+    expect(link.warning).toBeNull();
   });
 });

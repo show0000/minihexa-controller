@@ -18,14 +18,22 @@ function isModeOff(c: RobotCommand): boolean {
 
 /** Return the pending queue after adding `cmd`. */
 export function enqueue(pending: readonly RobotCommand[], cmd: RobotCommand): RobotCommand[] {
-  let keep: (p: RobotCommand) => boolean;
-  if (isStop(cmd)) {
-    keep = (p) => p.kind !== 'move' && p.kind !== 'pose';
+  // A pending STOP followed by another command (e.g. the STOP that zeroes the velocity before an
+  // action) must reach the robot before it. Only a STOP that is the last pending item may be
+  // replaced by a newer move.
+  const last = pending.length - 1;
+  const replaceableStop = (p: RobotCommand, i: number) => isStop(p) && i === last;
+  let keep: (p: RobotCommand, i: number) => boolean;
+  if (cmd.kind === 'move') {
+    // STOP also drops pending poses; a non-STOP move drops only older moves.
+    const dropPoses = isStop(cmd);
+    keep = (p, i) =>
+      p.kind === 'move' ? isStop(p) && !replaceableStop(p, i) : !(dropPoses && p.kind === 'pose');
   } else if (isModeOff(cmd)) {
     // A pending STOP stays: it is what confirms the robot stopped.
     keep = (p) => (p.kind !== 'move' || isStop(p)) && p.kind !== 'pose';
-  } else if (cmd.kind === 'move' || cmd.kind === 'pose') {
-    keep = (p) => p.kind !== cmd.kind;
+  } else if (cmd.kind === 'pose') {
+    keep = (p) => p.kind !== 'pose';
   } else {
     keep = () => true;
   }

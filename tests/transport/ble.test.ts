@@ -267,6 +267,21 @@ describe('BleTransport pending queue coalescing', () => {
     expect(out).toEqual(['K|1|3&', 'I|1&', 'J|1&', 'O&', 'H|1|1|1&', 'H|2|2|2&']);
   });
 
+  it('a STOP followed by a non-move command is never coalesced away', async () => {
+    const action: RobotCommand = { kind: 'action', id: 3 };
+    expect(await run([STOP, action, mv(0, 10)])).toEqual(['C|0|0|0&', 'K|1|3&', 'C|0|10|0&']);
+    expect(await run([STOP, action, STOP])).toEqual(['C|0|0|0&', 'K|1|3&', 'C|0|0|0&']);
+    expect(await run([STOP, { kind: 'led', r: 1, g: 1, b: 1 }, mv(0, 10)])).toEqual([
+      'C|0|0|0&',
+      'H|1|1|1&',
+      'C|0|10|0&',
+    ]);
+  });
+
+  it('a newer move may replace a STOP that is the last pending item', async () => {
+    expect(await run([STOP, mv(0, 10)])).toEqual(['C|0|10|0&']);
+  });
+
   it('a coalesced move goes to the back, after commands queued before it', async () => {
     expect(await run([mv(0, 10), { kind: 'reset' }, mv(0, 20)])).toEqual(['O&', 'C|0|20|0&']);
   });
@@ -324,5 +339,60 @@ describe('BleTransport STOP confirmation timeout', () => {
     t.handleDisconnected();
     await vi.advanceTimersByTimeAsync(1000);
     expect(ev.onStopTimeout).not.toHaveBeenCalled();
+  });
+});
+
+describe('BleTransport pump re-entrancy and final STOP', () => {
+  it('send() from inside onWritten does not start a second concurrent write', async () => {
+    const { c, writes, resolvers } = manualChar();
+    const ev = events();
+    const t = new BleTransport(c, ev);
+    const led = (n: number): RobotCommand => ({ kind: 'led', r: n, g: n, b: n });
+    ev.onWritten.mockImplementation((cmd) => {
+      if (cmd.kind === 'led' && cmd.r === 1) t.send(led(3));
+    });
+    t.send(led(1));
+    t.send(led(2));
+    await flush();
+    resolvers[0]!.ok();
+    await flush();
+    expect(writes).toEqual(['H|1|1|1&', 'H|2|2|2&']); // one write in flight
+    resolvers[1]!.ok();
+    await flush();
+    expect(writes).toEqual(['H|1|1|1&', 'H|2|2|2&', 'H|3|3|3&']);
+  });
+
+  it('finalStop drops everything pending, refuses new commands and resolves on its own STOP only', async () => {
+    const { c, writes, resolvers } = manualChar();
+    const t = new BleTransport(c, events());
+    t.send(STOP);
+    t.send({ kind: 'avoid', on: true });
+    await flush();
+    let result: boolean | null = null;
+    void t.finalStop().then((v) => (result = v));
+    t.send({ kind: 'balance', on: true }); // refused while closing
+    resolvers[0]!.ok(); // the earlier STOP
+    await flush();
+    expect(result).toBeNull();
+    expect(writes).toEqual(['C|0|0|0&', 'C|0|0|0&']);
+    resolvers[1]!.ok();
+    await flush();
+    expect(result).toBe(true);
+    expect(writes).toEqual(['C|0|0|0&', 'C|0|0|0&']);
+  });
+
+  it('finalStop resolves false when its write fails or the link drops', async () => {
+    const a = manualChar();
+    const ta = new BleTransport(a.c, events());
+    const ra = ta.finalStop();
+    await flush();
+    a.resolvers[0]!.fail(new Error('gatt'));
+    expect(await ra).toBe(false);
+
+    const b = manualChar();
+    const tb = new BleTransport(b.c, events());
+    const rb = tb.finalStop();
+    tb.handleDisconnected();
+    expect(await rb).toBe(false);
   });
 });

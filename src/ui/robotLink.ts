@@ -21,11 +21,27 @@ export const DISCONNECT_STOP_WAIT_MS = 500;
 
 export interface RobotTransport extends Transport {
   disconnect(): void;
+  /**
+   * Drop everything pending, start no further writes except one last STOP, and resolve true
+   * only when that STOP's own write succeeds (false on failure or link loss).
+   */
+  finalStop(): Promise<boolean>;
 }
 
 export interface RobotLinkOptions {
   connect?: (events: BleEvents) => Promise<RobotTransport>;
   bluetoothAvailable?: () => boolean;
+}
+
+/** Resolve with `p`'s value, or false if it takes longer than `ms`. */
+function withTimeout(p: Promise<boolean>, ms: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(false), ms);
+    void p.then((v) => {
+      clearTimeout(timer);
+      resolve(v);
+    });
+  });
 }
 
 function errorText(e: unknown): string {
@@ -42,8 +58,6 @@ export class RobotLink {
   private ble: RobotTransport | null = null;
   /** Whether the robot may be walking, from write outcomes (see the file comment). */
   private mayWalk = false;
-  /** Resolved with true by the next successful STOP write, false on link loss. */
-  private stopWaiters: Array<(confirmed: boolean) => void> = [];
   private readonly connectTransport: (events: BleEvents) => Promise<RobotTransport>;
   private readonly bluetoothAvailable: () => boolean;
 
@@ -121,40 +135,23 @@ export class RobotLink {
 
   /**
    * User disconnect. Call after sending the e-stop through the controller. Detaches the robot
-   * from the Fanout, sends one more STOP and waits up to DISCONNECT_STOP_WAIT_MS for a STOP write
-   * to succeed; if none does, the walking warning is shown after disconnecting.
+   * from the Fanout, then has the transport drop everything pending and write one final STOP;
+   * nothing else is started after this point. Waits up to DISCONNECT_STOP_WAIT_MS for that STOP's
+   * own write to succeed; if it does not, the walking warning is shown after disconnecting.
    */
   async disconnect(): Promise<void> {
     const t = this.ble;
     if (!t || this.state !== 'connected') return;
     this.state = 'disconnecting';
     this.fanout.setRobot(null);
-    const confirmed = this.nextStopConfirmed(DISCONNECT_STOP_WAIT_MS);
-    t.send(STOP);
-    const ok = await confirmed;
+    const ok = await withTimeout(t.finalStop(), DISCONNECT_STOP_WAIT_MS);
     if (this.ble !== t) return; // the link dropped while waiting
     if (!ok) this.mayWalk = true;
-    // Settle our state first: once a STOP is confirmed, only STOPs (ours) can still be queued
-    // behind it (the robot was detached from the Fanout before ours was sent), so outcomes
-    // the transport reports while closing must not raise a false warning.
+    // The final STOP was the last write the transport started, so a confirmed one means nothing
+    // written after it can be walking. Settle our state first so outcomes the transport reports
+    // while closing (e.g. an unconfirmed final STOP after a timeout) are ignored.
     this.handleDisconnect(t);
     t.disconnect();
-  }
-
-  private nextStopConfirmed(timeoutMs: number): Promise<boolean> {
-    return new Promise((resolve) => {
-      const timer = setTimeout(() => finish(false), timeoutMs);
-      const finish = (v: boolean) => {
-        clearTimeout(timer);
-        this.stopWaiters = this.stopWaiters.filter((w) => w !== finish);
-        resolve(v);
-      };
-      this.stopWaiters.push(finish);
-    });
-  }
-
-  private resolveStopWaiters(confirmed: boolean): void {
-    for (const w of [...this.stopWaiters]) w(confirmed);
   }
 
   private handleWritten(cmd: RobotCommand, ok: boolean): void {
@@ -164,7 +161,6 @@ export class RobotLink {
           this.mayWalk = true; // written, or unconfirmed: the robot may have it
         } else if (ok) {
           this.clearWalking();
-          this.resolveStopWaiters(true);
         } else {
           this.flagWalking();
         }
@@ -198,6 +194,5 @@ export class RobotLink {
     this.telemetry = null;
     if (this.mayWalk) this.warning = WALKING_WARNING;
     this.mayWalk = false;
-    this.resolveStopWaiters(false);
   }
 }

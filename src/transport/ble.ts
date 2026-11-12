@@ -1,4 +1,5 @@
 import {
+  STOP,
   BLE_NAME,
   BLE_UUIDS,
   encodeCommand,
@@ -47,6 +48,10 @@ export class BleTransport implements Transport {
   private inFlight: RobotCommand | null = null;
   private pending: RobotCommand[] = [];
   private stopTimer: ReturnType<typeof setTimeout> | null = null;
+  /** True while the pump loop runs; a nested pump() (e.g. send() from a handler) must not start. */
+  private pumping = false;
+  /** Set by finalStop(): only that STOP may still be written. */
+  private final: { cmd: RobotCommand; resolve: (ok: boolean) => void } | null = null;
   private readonly encoder = new TextEncoder();
   private readonly decoder = new TextDecoder();
   private dirty = false;
@@ -91,11 +96,36 @@ export class BleTransport implements Transport {
   }
 
   send(cmd: RobotCommand): void {
-    if (!this._connected) return;
+    if (!this._connected || this.final) return;
     this.pending = enqueue(this.pending, cmd);
     if (isStop(cmd)) this.armStopTimer();
     else if (!this.stopOutstanding()) this.clearStopTimer(); // a newer move replaced the STOP
     void this.pump();
+  }
+
+  /**
+   * Closing: drop every pending command, refuse new ones, and queue one last STOP behind the
+   * write already in flight (if any). Resolves true only when that STOP's own write succeeds;
+   * false if it fails or the link drops first. Nothing else is started after this call.
+   */
+  finalStop(): Promise<boolean> {
+    if (!this._connected) return Promise.resolve(false);
+    if (this.final) return Promise.resolve(false);
+    const cmd: RobotCommand = { ...STOP }; // its own identity: an earlier STOP does not count
+    const done = new Promise<boolean>((resolve) => {
+      this.final = { cmd, resolve };
+    });
+    this.pending = [cmd];
+    void this.pump();
+    return done;
+  }
+
+  private settleFinal(cmd: RobotCommand | null, ok: boolean): void {
+    const f = this.final;
+    if (f && (cmd === null || cmd === f.cmd)) {
+      f.resolve(ok);
+      this.final = { cmd: f.cmd, resolve: () => {} }; // stay closed
+    }
   }
 
   private stopOutstanding(): boolean {
@@ -117,25 +147,31 @@ export class BleTransport implements Transport {
   }
 
   private async pump(): Promise<void> {
-    if (this.inFlight) return;
-    while (this._connected) {
-      const cmd = this.pending.shift();
-      if (!cmd) return;
-      this.inFlight = cmd;
-      let ok = false;
-      let error: unknown = null;
-      try {
-        await this.write(cmd);
-        ok = true;
-      } catch (e) {
-        error = e;
+    if (this.pumping) return; // the running loop picks up whatever was queued
+    this.pumping = true;
+    try {
+      while (this._connected) {
+        const cmd = this.pending.shift();
+        if (!cmd) return;
+        this.inFlight = cmd;
+        let ok = false;
+        let error: unknown = null;
+        try {
+          await this.write(cmd);
+          ok = true;
+        } catch (e) {
+          error = e;
+        }
+        // A disconnect while in flight has already reported this command.
+        if (this.inFlight !== cmd) return;
+        this.inFlight = null;
+        if (!ok) this.call(() => this.events.onError(error));
+        if (ok && isStop(cmd)) this.clearStopTimer();
+        this.settleFinal(cmd, ok); // before handlers: one of them may close the link
+        this.call(() => this.events.onWritten(cmd, ok));
       }
-      // A disconnect while in flight has already reported this command.
-      if (this.inFlight !== cmd) return;
-      this.inFlight = null;
-      if (!ok) this.call(() => this.events.onError(error));
-      if (ok && isStop(cmd)) this.clearStopTimer();
-      this.call(() => this.events.onWritten(cmd, ok));
+    } finally {
+      this.pumping = false;
     }
   }
 
@@ -184,6 +220,7 @@ export class BleTransport implements Transport {
     const lost = this.inFlight;
     this.inFlight = null;
     if (lost) this.call(() => this.events.onWritten(lost, false));
+    this.settleFinal(null, false);
     this.events.onDisconnect();
   }
 
