@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" href="data:," />
+    <title>miniHexa 조종기</title>
+  </head>
+  <body>
+    <main class="app">
+      <section class="view">
+        <canvas id="sim" aria-label="시뮬레이터"></canvas>
+      </section>
+      <aside class="panel">
+        <h1>miniHexa 조종기</h1>
+        <button id="estop" class="estop" type="button">비상 정지</button>
+        <div id="warning" class="warning" role="alert" hidden></div>
+        <div id="notice" class="notice" hidden></div>
+        <dl class="status">
+          <dt>로봇</dt><dd id="st-conn">연결 안 됨</dd>
+          <dt>게임패드</dt><dd id="st-pad">없음</dd>
+          <dt>배터리</dt><dd id="st-battery">-</dd>
+          <dt>거리</dt><dd id="st-distance">-</dd>
+          <dt>모드</dt><dd id="st-mode">-</dd>
+          <dt>높이</dt><dd id="st-height">-</dd>
+        </dl>
+        <div id="st-lock" class="lock" hidden></div>
+        <div id="st-latch" class="lock" hidden>스틱을 중앙으로 돌려 주세요</div>
+        <div class="buttons">
+          <button id="connect" type="button">로봇 연결</button>
+          <button id="bind" type="button">버튼 지정</button>
+          <button id="export" type="button">매핑 내보내기</button>
+          <button id="import" type="button">매핑 불러오기</button>
+          <input id="import-file" type="file" accept="application/json,.json" hidden />
+        </div>
+        <p class="hint">로봇 없이도 시뮬레이터로 조종할 수 있습니다. 동작 중에는 조종 입력이 잠기며, 그 사이 누른 비상 정지는 동작이 끝나는 즉시 보냅니다.</p>
+      </aside>
+    </main>
+
+    <div id="wizard" class="wizard" hidden>
+      <div class="wizard-box" role="dialog" aria-modal="true" aria-labelledby="wz-title">
+        <h2 id="wz-title">버튼 지정</h2>
+        <p id="wz-progress" class="wz-progress"></p>
+        <p id="wz-prompt" class="wz-prompt"></p>
+        <p id="wz-message" class="wz-message"></p>
+        <p id="wz-pad" class="wz-pad"></p>
+        <div class="wz-row">
+          <button id="wz-skip" type="button">건너뛰기</button>
+          <button id="wz-restart" type="button">처음부터</button>
+          <button id="wz-cancel" type="button">취소</button>
+        </div>
+        <fieldset id="wz-actions" class="wz-actions" hidden>
+          <legend>동작 버튼에 연결할 번호 (1~50)</legend>
+          <div id="wz-action-rows"></div>
+          <button id="wz-save" type="button" class="primary">저장</button>
+        </fieldset>
+      </div>
+    </div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
