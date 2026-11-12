@@ -63,7 +63,8 @@ describe('Controller: sending rules', () => {
     // STOP beats a pending button command even inside the rate-limit window
     c.update(150, inp({ moveY: 0.5 }));
     expect(c.update(160, inp({ ledNext: 1 }))).toEqual([STOP]);
-    expect(c.update(200, N)).toEqual([{ kind: 'led', r: LED_PALETTE[1]![0], g: LED_PALETTE[1]![1], b: LED_PALETTE[1]![2] }]);
+    expect(c.update(200, N)).toEqual([]); // the STOP at 160 holds the slot until 210
+    expect(c.update(210, N)).toEqual([{ kind: 'led', r: LED_PALETTE[1]![0], g: LED_PALETTE[1]![1], b: LED_PALETTE[1]![2] }]);
   });
 
   it('move not starved by pose', () => {
@@ -174,11 +175,15 @@ describe('Controller: actions', () => {
     expect(c.update(50, inp({ action1: 1, moveY: 1 }))).toEqual([STOP]);
     expect(c.update(100, inp({ action1: 1, moveY: 1 }))).toEqual([{ kind: 'action', id: 1 }]);
     const ends = c.status().actionEndsAt!;
-    expect(c.update(ends, inp({ moveY: 1 }))).toEqual([move(0, 50)]);
+    // pose belief is unknown after an action, so the pose is re-sent too (alternating)
+    expect(c.update(ends, inp({ moveY: 1 }))).toEqual([pose(0, 0)]);
+    expect(c.update(ends + 50, inp({ moveY: 1 }))).toEqual([move(0, 50)]);
     const c2 = mk();
     c2.update(0, inp({ action1: 1 }));
-    expect(c2.update(c2.status().actionEndsAt!, N)).toEqual([]);
+    const ends2 = c2.status().actionEndsAt!;
+    expect(c2.update(ends2, N)).toEqual([pose(0, 0)]);
     expect(c2.status().mode).toBe('manual');
+    for (let t = ends2 + 50; t < ends2 + 500; t += 50) expect(c2.update(t, N)).toEqual([]);
   });
 });
 
@@ -324,7 +329,10 @@ describe('Controller: loss, hidden and estop', () => {
     const c = mk();
     c.update(0, inp({ moveY: 1 }));
     expect(c.estop(10)).toEqual([STOP]);
-    for (let t = 50; t <= 300; t += 50) expect(c.update(t, inp({ moveY: 1 }))).toEqual([]);
+    for (let t = 50; t <= 300; t += 50) {
+      // only the two STOP repeats go out while the latched stick is held
+      expect(c.update(t, inp({ moveY: 1 }))).toEqual(t === 100 || t === 150 ? [STOP] : []);
+    }
     expect(c.update(350, N)).toEqual([]);
     expect(c.update(400, inp({ moveY: 1 }))).toEqual([move(0, 50)]);
   });
@@ -338,7 +346,8 @@ describe('Controller: zero the firmware velocity before mode/action intents', ()
     expect(c.update(0, inp({ moveY: 1 }))).toEqual([move(0, 50)]);
     expect(c.update(10, inp({ moveY: 1, action1: 1 }))).toEqual([STOP]);
     expect(c.update(30, inp({ moveY: 1, action1: 1 }))).toEqual([]);
-    expect(c.update(50, inp({ moveY: 1, action1: 1 }))).toEqual([{ kind: 'action', id: 1 }]);
+    expect(c.update(59, inp({ moveY: 1, action1: 1 }))).toEqual([]); // STOP holds its slot
+    expect(c.update(60, inp({ moveY: 1, action1: 1 }))).toEqual([{ kind: 'action', id: 1 }]);
     expect(c.status().mode).toBe('action');
   });
 
@@ -346,7 +355,8 @@ describe('Controller: zero the firmware velocity before mode/action intents', ()
     const c = mk();
     c.update(0, inp({ moveY: 1 }));
     expect(c.update(10, inp({ moveY: 1, balanceToggle: 1 }))).toEqual([STOP]);
-    expect(c.update(50, inp({ moveY: 1, balanceToggle: 1 }))).toEqual([{ kind: 'balance', on: true }]);
+    expect(c.update(59, inp({ moveY: 1, balanceToggle: 1 }))).toEqual([]);
+    expect(c.update(60, inp({ moveY: 1, balanceToggle: 1 }))).toEqual([{ kind: 'balance', on: true }]);
   });
 
   it('(c) balance entered from walking, then estop: STOP preceded balance on', () => {
@@ -365,7 +375,8 @@ describe('Controller: zero the firmware velocity before mode/action intents', ()
     const c = mk();
     c.update(0, inp({ moveY: 1 }));
     expect(c.update(10, inp({ moveY: 1, avoidToggle: 1 }))).toEqual([STOP]);
-    expect(c.update(50, inp({ moveY: 1, avoidToggle: 1 }))).toEqual([{ kind: 'avoid', on: true }]);
+    expect(c.update(59, inp({ moveY: 1, avoidToggle: 1 }))).toEqual([]);
+    expect(c.update(60, inp({ moveY: 1, avoidToggle: 1 }))).toEqual([{ kind: 'avoid', on: true }]);
   });
 
   it('no extra STOP when already stopped, nor before reset or led', () => {
@@ -395,5 +406,82 @@ describe('Controller: review fixes', () => {
     c.update(50, inp({ tiltPitch: 1, action1: 1 }));
     expect(c.status().mode).toBe('action');
     expect(c.update(c.status().actionEndsAt!, inp({ tiltPitch: 1 }))).toEqual([pose(50, 0)]);
+  });
+});
+
+describe('Controller: STOP slot occupancy and redundancy', () => {
+  const run = (c: Controller, from: number, to: number, input: ControlInput) => {
+    const out: [number, RobotCommand][] = [];
+    for (let t = from; t <= to; t += 10) for (const cmd of c.update(t, input)) out.push([t, cmd]);
+    return out;
+  };
+
+  it('a STOP occupies the send slot: the next command waits SEND_INTERVAL_MS', () => {
+    const c = mk();
+    c.update(0, inp({ moveY: 1 }));
+    expect(c.update(100, N)).toEqual([STOP]);
+    expect(c.update(110, inp({ reset: 1 }))).toEqual([]);
+    expect(c.update(149, inp({ reset: 1 }))).toEqual([]);
+    expect(c.update(150, inp({ reset: 1 }))).toEqual([{ kind: 'reset' }]);
+  });
+
+  it('estop / gamepadLost / hidden STOPs occupy the slot too', () => {
+    for (const fn of ['estop', 'gamepadLost', 'hidden'] as const) {
+      const c = mk();
+      c.update(0, N);
+      expect(c[fn](100)).toEqual([STOP]);
+      c.update(105, N); // gamepadLost/hidden ignore edges on the first update after
+      expect(c.update(110, inp({ ledNext: 1 }))).toEqual([]);
+      expect(c.update(150, inp({ ledNext: 1 }))[0]?.kind).toBe('led');
+    }
+  });
+
+  it('stop -> STOP at t, again at >= t+50 and >= t+100, then nothing more', () => {
+    const c = mk();
+    c.update(0, inp({ moveY: 1 }));
+    const out = run(c, 10, 600, N);
+    expect(out).toEqual([[10, STOP], [60, STOP], [110, STOP]]);
+  });
+
+  it('stop then immediate re-push: no STOP repeats, the move goes out in the next slot', () => {
+    const c = mk();
+    c.update(0, inp({ moveY: 1 }));
+    expect(c.update(10, N)).toEqual([STOP]);
+    const out = run(c, 20, 600, inp({ moveY: 1 }));
+    expect(out).toEqual([[60, move(0, 50)]]);
+  });
+
+  it('a queued intent takes priority over repeats and cancels them', () => {
+    const c = mk();
+    c.update(0, inp({ moveY: 1 }));
+    expect(c.update(10, inp({ ledNext: 1 }))).toEqual([STOP]);
+    const out = run(c, 20, 600, inp({ ledNext: 1 }));
+    expect(out.map(([t, cmd]) => [t, cmd.kind])).toEqual([[60, 'led']]);
+  });
+
+  it('the pre-intent STOP is the only STOP once the intent is sent', () => {
+    const c = mk();
+    c.update(0, inp({ moveY: 1 }));
+    expect(c.update(10, inp({ moveY: 1, balanceToggle: 1 }))).toEqual([STOP]);
+    expect(c.update(60, inp({ balanceToggle: 1 }))).toEqual([{ kind: 'balance', on: true }]);
+    expect(run(c, 70, 600, N)).toEqual([]);
+  });
+
+  it('estop that becomes pending during a lock: STOP after the lock, then two repeats', () => {
+    const c = mk();
+    c.update(0, inp({ action1: 1 }));
+    c.estop(100);
+    const ends = c.status().actionEndsAt!;
+    const out = run(c, ends, ends + 500, N);
+    expect(out).toEqual([[ends, STOP], [ends + 50, STOP], [ends + 100, STOP], [ends + 150, pose(0, 0)]]);
+  });
+
+  it('pose is re-sent after an action even if neutral: tilt released during the lock', () => {
+    const c = mk();
+    expect(c.update(0, inp({ tiltPitch: 1, tiltRoll: 1 }))).toEqual([pose(50, 50)]);
+    expect(c.update(50, inp({ tiltPitch: 1, tiltRoll: 1, action1: 1 }))).toEqual([{ kind: 'action', id: 1 }]);
+    const ends = c.status().actionEndsAt!;
+    expect(c.update(ends - 100, N)).toEqual([]);
+    expect(c.update(ends, N)).toEqual([pose(0, 0)]);
   });
 });
