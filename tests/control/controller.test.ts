@@ -540,3 +540,63 @@ describe('Controller: Task 6 UI hooks', () => {
     expect(later).toContainEqual(pose(0, 0));
   });
 });
+
+describe('Controller: resync always stops first', () => {
+  const run = (c: Controller, from: number, to: number, input = N) => {
+    const out: RobotCommand[] = [];
+    for (let t = from; t < to; t += 16) out.push(...c.update(t, input));
+    return out;
+  };
+
+  for (const mode of ['avoid', 'balance'] as const) {
+    it(`${mode}: STOP first, then ${mode} off in a later slot, STOP repeats, then the pose`, () => {
+      const c = mk();
+      c.update(0, inp({ [`${mode}Toggle`]: 1 }));
+      c.update(100, N);
+      expect(c.status().mode).toBe(mode);
+      const first = c.resync(200);
+      expect(first).toEqual([STOP]);
+      expect(c.status()).toMatchObject({ mode: 'manual', stickLatched: true });
+      const later = run(c, 216, 600);
+      const offAt = later.findIndex((x) => x.kind === mode);
+      expect(later[offAt]).toEqual({ kind: mode, on: false });
+      expect(later.filter((x) => x.kind === 'move')).toEqual([STOP, STOP]);
+      expect(later.filter((x) => x.kind !== 'move' && x.kind !== mode)).toEqual([pose(0, 0)]);
+      expect(later.indexOf(later.find((x) => x.kind === 'pose')!)).toBeGreaterThan(offAt);
+    });
+  }
+
+  it('action: STOP first, the lock is cancelled and nothing is deferred', () => {
+    const c = mk();
+    c.update(0, inp({ action1: 1 }));
+    run(c, 16, 200);
+    expect(c.status().mode).toBe('action');
+    c.estop(210); // pending estop must not fire later
+    expect(c.status().estopPending).toBe(true);
+    const first = c.resync(300);
+    expect(first[0]).toEqual(STOP);
+    expect(first).toEqual([STOP]);
+    expect(c.status()).toMatchObject({ mode: 'manual', estopPending: false, actionEndsAt: null, stickLatched: true });
+    const later = run(c, 316, 800);
+    expect(later.filter((x) => x.kind === 'move')).toEqual([STOP, STOP]);
+    expect(later).toContainEqual(pose(0, 0));
+    // after the lock time, no extra deferred STOP burst
+    expect(run(c, 800, actionDurationMs(DEFAULT_ACTION_IDS.action1) + ACTION_MARGIN_MS + 1000)).toEqual([]);
+  });
+
+  it('a held stick stays latched after resync until neutral', () => {
+    const c = mk();
+    c.update(0, inp({ moveY: 1 }));
+    expect(c.resync(100)).toEqual([STOP]);
+    expect(run(c, 116, 400, inp({ moveY: 1 })).filter((x) => x.kind === 'move' && x.vy !== 0)).toEqual([]);
+  });
+
+  it('an estop right after resync in avoid keeps the pending avoid off', () => {
+    const c = mk();
+    c.update(0, inp({ avoidToggle: 1 }));
+    c.update(100, N);
+    c.resync(200);
+    expect(c.estop(210)).toEqual([STOP]);
+    expect(run(c, 226, 600)).toContainEqual({ kind: 'avoid', on: false });
+  });
+});

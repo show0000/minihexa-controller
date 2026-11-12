@@ -34,8 +34,8 @@ export class RobotLink {
     }
     this.state = 'connecting';
     this.notice = null;
+    let t: BleTransport | null = null;
     try {
-      let t: BleTransport | null = null;
       t = await BleTransport.connect({
         onTelemetry: (tel) => {
           this.telemetry = tel;
@@ -48,19 +48,31 @@ export class RobotLink {
           this.notice = `전송 오류: ${errorText(e)}`;
         },
       });
-      this.ble = t;
-      this.fanout.setRobot(t);
-      this.state = 'connected';
-      this.warning = null;
-      this.mayWalk = false;
-      // Unknown robot state after (re)connecting: the controller puts it in a known one.
-      this.onConnected();
     } catch (e) {
       this.state = 'disconnected';
       // NotFoundError: the user closed the device chooser.
       if (!(e instanceof DOMException && e.name === 'NotFoundError')) {
         this.notice = `연결 실패: ${errorText(e)}`;
       }
+      return;
+    }
+
+    // Commit the connected state fully before anything else can run.
+    this.ble = t;
+    this.fanout.setRobot(t);
+    this.state = 'connected';
+    this.warning = null;
+    this.mayWalk = false;
+
+    // Unknown robot state after (re)connecting: the controller puts it in a known one.
+    try {
+      this.onConnected();
+    } catch (e) {
+      // The robot is not in a known state: do not stay connected to it. disconnect() rolls the
+      // state back through handleDisconnect (ble, fanout, state, telemetry).
+      console.error('robot resync failed', e);
+      t.disconnect();
+      this.notice = `연결 후 초기화에 실패해 연결을 끊었습니다: ${errorText(e)}`;
     }
   }
 

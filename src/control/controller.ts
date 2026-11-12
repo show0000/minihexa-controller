@@ -49,7 +49,9 @@ type Intent =
   | { kind: 'balance' }
   | { kind: 'reset' }
   | { kind: 'led' }
-  | { kind: 'action'; id: number };
+  | { kind: 'action'; id: number }
+  /** Turn a firmware mode off after a resync STOP (the STOP keeps its own slot). */
+  | { kind: 'off'; mode: 'avoid' | 'balance' };
 
 const NEUTRAL_POSE = (z: number): RobotCommand => ({
   kind: 'pose', yaw: 0, pitch: 0, roll: 0, x: 0, y: 0, z: Math.round(z),
@@ -166,7 +168,7 @@ export class Controller {
     const intent = this.queue.shift();
     if (intent) {
       this.lastSlotAt = now;
-      this.stopRepeats = 0;
+      if (intent.kind !== 'off') this.stopRepeats = 0; // a mode-off keeps the STOP repeats coming
       return [this.apply(intent, now)];
     }
 
@@ -206,13 +208,21 @@ export class Controller {
   }
 
   /**
-   * After a (re)connected robot whose state is unknown: e-stop, and treat the pose as unknown
-   * so the believed pose (height, tilt) is re-sent on the next free slot.
+   * After (re)connecting a robot whose state is unknown (it may still be walking from an
+   * earlier session): STOP immediately in every mode, with repeats and the stick latch as for
+   * an e-stop. Avoid/balance are turned off in a later slot; an action lock is dropped (the new
+   * robot is not running it). The pose is treated as unknown so it is re-sent after the STOP.
    */
   resync(now: number): RobotCommand[] {
-    const out = this.estop(now);
+    const was = this.mode;
+    this.queue = [];
+    this.mode = 'manual';
+    this.actionEndsAt = null;
+    this.estopPending = false;
+    if (was === 'avoid' || was === 'balance') this.queue.push({ kind: 'off', mode: was });
+    this.moveLatched = true;
     this.lastPose = null;
-    return out;
+    return [this.emitStop(now)];
   }
 
   estop(now: number): RobotCommand[] {
@@ -235,7 +245,8 @@ export class Controller {
 
   /** Shared stop path for e-stop, gamepad loss and page hide. */
   private halt(now: number): RobotCommand[] {
-    this.queue = [];
+    // Keep a pending mode-off from resync: it is part of stopping.
+    this.queue = this.queue.filter((i) => i.kind === 'off');
     switch (this.mode) {
       case 'action':
         this.estopPending = true;
@@ -292,6 +303,8 @@ export class Controller {
         this.mode = intent.kind;
         this.queue = [];
         return { kind: intent.kind, on: true };
+      case 'off':
+        return { kind: intent.mode, on: false };
       case 'reset':
         this.z = DEFAULT_Z;
         this.lastPose = NEUTRAL_POSE(DEFAULT_Z);
