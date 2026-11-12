@@ -1,5 +1,5 @@
 import './ui/styles.css';
-import { Controller } from './control/controller';
+import { Controller, SEND_INTERVAL_MS } from './control/controller';
 import { readControls, type Mapping } from './input/mapping';
 import type { RobotCommand } from './protocol/commands';
 import { createScene } from './sim/scene';
@@ -7,6 +7,7 @@ import { SimRobot } from './sim/robotModel';
 import { Fanout } from './transport/fanout';
 import { createBindingWizard } from './ui/bindingWizard';
 import { PadTracker, snapshot } from './ui/gamepad';
+import { startHiddenTick } from './ui/hiddenTick';
 import { downloadMapping, emptyMapping, loadMapping, readMappingFile, saveMapping } from './ui/mappingStore';
 import { RobotLink } from './ui/robotLink';
 import { createStatusPanel } from './ui/statusPanel';
@@ -90,6 +91,20 @@ document.addEventListener('visibilitychange', () => {
   if (document.hidden) send(controller.hidden(performance.now()));
 });
 window.addEventListener('blur', () => send(controller.hidden(performance.now())));
+// Without rAF, STOP repeats and a deferred e-stop still have to go out.
+startHiddenTick({
+  isHidden: () => document.hidden,
+  tick: () => send(controller.update(performance.now(), NEUTRAL)),
+  intervalMs: SEND_INTERVAL_MS,
+});
+// Leaving the page does not stop the robot by itself (the firmware ignores the BLE drop).
+window.addEventListener('beforeunload', (e) => {
+  if (!link.robotMayWalk) return;
+  send(controller.estop(performance.now())); // stopping is always safe, even if the user stays
+  e.preventDefault();
+  e.returnValue = '';
+});
+window.addEventListener('pagehide', () => send(controller.estop(performance.now())));
 
 function frame(): void {
   // Schedule first so one exception cannot stop the loop (and with it every STOP).
