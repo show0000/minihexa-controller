@@ -171,7 +171,8 @@ describe('Controller: actions', () => {
   it('after a lock ends without estop, nothing special is sent and a held stick re-sends', () => {
     const c = mk();
     c.update(0, inp({ moveY: 1 }));
-    c.update(50, inp({ action1: 1, moveY: 1 }));
+    expect(c.update(50, inp({ action1: 1, moveY: 1 }))).toEqual([STOP]);
+    expect(c.update(100, inp({ action1: 1, moveY: 1 }))).toEqual([{ kind: 'action', id: 1 }]);
     const ends = c.status().actionEndsAt!;
     expect(c.update(ends, inp({ moveY: 1 }))).toEqual([move(0, 50)]);
     const c2 = mk();
@@ -228,12 +229,13 @@ describe('Controller: avoid and balance', () => {
     it(`${kind}: after exit, the believed motion is stopped so a held stick re-sends`, () => {
       const c = mk();
       c.update(0, inp({ moveY: 1 }));
-      c.update(50, inp({ moveY: 1, [toggle]: 1 }));
+      expect(c.update(50, inp({ moveY: 1, [toggle]: 1 }))).toEqual([STOP]);
+      expect(c.update(100, inp({ moveY: 1, [toggle]: 1 }))).toEqual([{ kind, on: true }]);
       expect(c.status().mode).toBe(kind);
       // the still-held stick exits the mode
-      expect(c.update(100, inp({ moveY: 1 }))).toEqual([{ kind, on: false }]);
-      // last sent move was move(0,50), but the robot is stopped now: re-send it
-      expect(c.update(150, inp({ moveY: 1 }))).toEqual([move(0, 50)]);
+      expect(c.update(150, inp({ moveY: 1 }))).toEqual([{ kind, on: false }]);
+      // the robot is stopped now: the held stick re-sends its move
+      expect(c.update(200, inp({ moveY: 1 }))).toEqual([move(0, 50)]);
     });
   }
 });
@@ -325,5 +327,73 @@ describe('Controller: loss, hidden and estop', () => {
     for (let t = 50; t <= 300; t += 50) expect(c.update(t, inp({ moveY: 1 }))).toEqual([]);
     expect(c.update(350, N)).toEqual([]);
     expect(c.update(400, inp({ moveY: 1 }))).toEqual([move(0, 50)]);
+  });
+});
+
+describe('Controller: zero the firmware velocity before mode/action intents', () => {
+  // remote.ino: global `vel` changes only on C commands; actions and balance(true) leave it,
+  // and pose / balance-off call move(&vel, ...) with it, which restarts walking.
+  it('(a) walking + action1: STOP first (bypassing the rate limit), then the action in the next slot', () => {
+    const c = mk();
+    expect(c.update(0, inp({ moveY: 1 }))).toEqual([move(0, 50)]);
+    expect(c.update(10, inp({ moveY: 1, action1: 1 }))).toEqual([STOP]);
+    expect(c.update(30, inp({ moveY: 1, action1: 1 }))).toEqual([]);
+    expect(c.update(50, inp({ moveY: 1, action1: 1 }))).toEqual([{ kind: 'action', id: 1 }]);
+    expect(c.status().mode).toBe('action');
+  });
+
+  it('(b) walking + balanceToggle: STOP, then balance on', () => {
+    const c = mk();
+    c.update(0, inp({ moveY: 1 }));
+    expect(c.update(10, inp({ moveY: 1, balanceToggle: 1 }))).toEqual([STOP]);
+    expect(c.update(50, inp({ moveY: 1, balanceToggle: 1 }))).toEqual([{ kind: 'balance', on: true }]);
+  });
+
+  it('(c) balance entered from walking, then estop: STOP preceded balance on', () => {
+    const c = mk();
+    const sent: RobotCommand[] = [];
+    sent.push(...c.update(0, inp({ moveY: 1 })));
+    sent.push(...c.update(10, inp({ moveY: 1, balanceToggle: 1 })));
+    sent.push(...c.update(50, inp({ moveY: 1, balanceToggle: 1 })));
+    sent.push(...c.update(100, N));
+    expect(c.status().mode).toBe('balance');
+    sent.push(...c.estop(150));
+    expect(sent).toEqual([move(0, 50), STOP, { kind: 'balance', on: true }, { kind: 'balance', on: false }]);
+  });
+
+  it('(d) walking + avoidToggle: STOP, then avoid on', () => {
+    const c = mk();
+    c.update(0, inp({ moveY: 1 }));
+    expect(c.update(10, inp({ moveY: 1, avoidToggle: 1 }))).toEqual([STOP]);
+    expect(c.update(50, inp({ moveY: 1, avoidToggle: 1 }))).toEqual([{ kind: 'avoid', on: true }]);
+  });
+
+  it('no extra STOP when already stopped, nor before reset or led', () => {
+    const c = mk();
+    expect(c.update(0, inp({ action1: 1 }))).toEqual([{ kind: 'action', id: 1 }]);
+    const d = mk();
+    d.update(0, inp({ moveY: 1 }));
+    expect(d.update(50, inp({ moveY: 1, ledNext: 1 }))[0]!.kind).toBe('led');
+  });
+});
+
+describe('Controller: review fixes', () => {
+  for (const kind of ['avoid', 'balance'] as const) {
+    it(`${kind}: tilt stick beyond the deadzone exits the mode`, () => {
+      const c = mk();
+      c.update(0, inp({ [kind === 'avoid' ? 'avoidToggle' : 'balanceToggle']: 1 }));
+      c.update(10, N);
+      expect(c.update(20, inp({ tiltRoll: 0.3 }))).toEqual([{ kind, on: false }]);
+      expect(c.status().mode).toBe('manual');
+      expect(c.update(70, inp({ tiltRoll: 0.3 }))).toEqual([pose(0, 15)]);
+    });
+  }
+
+  it('a tilt held through an action is re-sent when the lock ends', () => {
+    const c = mk();
+    expect(c.update(0, inp({ tiltPitch: 1 }))).toEqual([pose(50, 0)]);
+    c.update(50, inp({ tiltPitch: 1, action1: 1 }));
+    expect(c.status().mode).toBe('action');
+    expect(c.update(c.status().actionEndsAt!, inp({ tiltPitch: 1 }))).toEqual([pose(50, 0)]);
   });
 });

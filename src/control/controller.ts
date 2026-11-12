@@ -93,10 +93,12 @@ export class Controller {
 
     if (this.mode === 'action') {
       if (this.actionEndsAt !== null && now < this.actionEndsAt) return [];
-      // Lock over: the firmware finished the script with zero velocity.
+      // Lock over. The firmware's global velocity is 0 because a STOP always goes out
+      // before an action (see update), and every action ends level.
       this.mode = 'manual';
       this.actionEndsAt = null;
       this.lastMove = STOP;
+      this.lastPose = NEUTRAL_POSE(this.z);
       if (this.estopPending) {
         this.estopPending = false;
         this.moveLatched = true;
@@ -107,7 +109,8 @@ export class Controller {
     const desiredMove = this.moveFrom(input);
 
     if (this.mode === 'avoid' || this.mode === 'balance') {
-      if (edges.size > 0 || !commandsEqual(desiredMove, STOP)) return [this.exitMode()];
+      const tilted = !commandsEqual(this.poseFrom(input), NEUTRAL_POSE(this.z));
+      if (edges.size > 0 || !commandsEqual(desiredMove, STOP) || tilted) return [this.exitMode()];
       return [];
     }
 
@@ -124,6 +127,15 @@ export class Controller {
 
     // Safety: stop immediately, regardless of the rate limit.
     if (commandsEqual(wantMove, STOP) && !commandsEqual(this.lastMove, STOP)) {
+      this.lastMove = STOP;
+      return [STOP];
+    }
+
+    // Firmware actions and balance-on run with the stale global velocity, and pose or
+    // balance-off would restart walking with it. Zero it first; the intent waits for
+    // the next slot.
+    const next = this.queue[0];
+    if (next && next.kind !== 'reset' && next.kind !== 'led' && !commandsEqual(this.lastMove, STOP)) {
       this.lastMove = STOP;
       return [STOP];
     }
@@ -154,25 +166,25 @@ export class Controller {
   }
 
   gamepadLost(now: number): RobotCommand[] {
-    const out = this.halt(now);
+    const out = this.halt();
     this.prevPressed = null; // a reconnected pad may come back with buttons held
     return out;
   }
 
   hidden(now: number): RobotCommand[] {
-    const out = this.halt(now);
+    const out = this.halt();
     this.prevPressed = null;
     return out;
   }
 
   estop(now: number): RobotCommand[] {
-    const out = this.halt(now);
+    const out = this.halt();
     this.moveLatched = true;
     return out;
   }
 
   /** Shared stop path for e-stop, gamepad loss and page hide. */
-  private halt(_now: number): RobotCommand[] {
+  private halt(): RobotCommand[] {
     this.queue = [];
     switch (this.mode) {
       case 'action':
