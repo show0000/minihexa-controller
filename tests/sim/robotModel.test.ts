@@ -158,6 +158,25 @@ describe('SimRobot', () => {
     expect(f.body.roll).toBeCloseTo(0);
   });
 
+  it('balance off during avoid drops the avoid walk for the latched C velocity (remote.ino)', () => {
+    const r = new SimRobot();
+    r.tick(0);
+    r.apply({ kind: 'avoid', on: true }, 0);
+    runTo(r, 0, 500);
+    r.apply({ kind: 'balance', on: false }, 500);
+    const a = runTo(r, 500, 1200).odom;
+    expect(runTo(r, 1200, 2000).odom).toEqual(a); // no C yet: latched vel is 0
+
+    const w = new SimRobot();
+    w.tick(0);
+    w.apply(move(0, -50), 0);
+    w.apply({ kind: 'avoid', on: true }, 100);
+    runTo(w, 0, 500);
+    w.apply({ kind: 'balance', on: false }, 500);
+    const b = runTo(w, 500, 1000).odom.y;
+    expect(runTo(w, 1000, 2000).odom.y).toBeLessThan(b - 5); // back to the latched backward walk
+  });
+
   describe('actions', () => {
     it('action 4 is busy for 8700ms', () => {
       const r = new SimRobot();

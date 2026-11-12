@@ -35,7 +35,8 @@ describe('leg geometry', () => {
       { x: -4.34, y: 0, z: 0 },
       { x: -3.15, y: -5.65, z: 0 },
     ]);
-    LEG_ORIGINS.forEach((o, i) => close(LEG_MOUNT_ANGLE[i]!, Math.atan2(o.y, o.x)));
+    // Firmware leg frames: hiwonder_robot.cpp 215-227 (rotations), 580-585 (inverse).
+    [-45, 0, 45, 135, 180, -135].forEach((deg, i) => close(LEG_MOUNT_ANGLE[i]!, (deg * Math.PI) / 180));
   });
 });
 
@@ -62,6 +63,13 @@ describe('ikLeg / fkLeg', () => {
       expect(j, `leg ${i}`).not.toBeNull();
       closeV(fkLeg(j!), local);
       closeJ(ikLeg(fkLeg(j!))!, j!);
+    });
+  });
+
+  it('puts every STANCE foot straight out along its leg frame (joint a = 0)', () => {
+    STANCE.forEach((foot, i) => {
+      const j = ikLeg(bodyToLeg(i, foot))!;
+      expect(Math.abs(j.a), `leg ${i}`).toBeLessThan(1e-9);
     });
   });
 

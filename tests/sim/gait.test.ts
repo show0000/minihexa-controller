@@ -26,7 +26,7 @@ const lifted = (s: GaitState) =>
 
 describe('GAIT constants', () => {
   it('match the brief', () => {
-    expect(GAIT).toEqual({ minPeriodMs: 400, lift: 3, maxHalfStep: 3, cmPerSecAtMax: 15 });
+    expect(GAIT).toEqual({ minPeriodMs: 400, lift: 3, maxHalfStep: 3, cmPerSecAtMax: 20 });
   });
   it('period is the firmware move_time: 600ms up to a 3cm half step, shorter above, never < 400', () => {
     expect(gaitPeriodMs({ vx: 0, vy: 3, omega: 0 })).toBe(600);
@@ -88,9 +88,39 @@ describe('stepGait', () => {
     expect(run(initGait(), 2000, { vx: 0, vy: -3, omega: 0 }).odom.y).toBeLessThan(0);
   });
 
-  it('walks at cmPerSecAtMax for a full forward stride', () => {
-    const s = run(initGait(), 1000, { vx: 0, vy: 3, omega: 0 });
-    expect(s.odom.y).toBeCloseTo(GAIT.cmPerSecAtMax, 6);
+  it.each<[string, Vel]>([
+    ['forward vy', { vx: 0, vy: 3, omega: 0 }],
+    ['sideways vx', { vx: -2, vy: 0, omega: 0 }],
+    ['turn in place', { vx: 0, vy: 0, omega: 2.5 }],
+    ['combined', { vx: 1, vy: 1.5, omega: -0.2 }],
+  ])('keeps planted feet fixed on the ground (%s)', (_, vel) => {
+    // world(foot) = odom pose applied to the body-frame foot
+    const world = (s: GaitState, i: number) => {
+      const f = s.feet[i]!;
+      const { x, y, heading: h } = s.odom;
+      return { x: x + f.x * Math.cos(h) - f.y * Math.sin(h), y: y + f.x * Math.sin(h) + f.y * Math.cos(h) };
+    };
+    const planted = (s: GaitState, i: number) => s.feet[i]!.z === STANCE[i]!.z;
+    let prev = stepGait(initGait(), 7, vel);
+    let checked = 0;
+    for (let n = 0; n < 400; n++) {
+      const next = stepGait(prev, 7, vel);
+      for (let i = 0; i < 6; i++) {
+        if (!planted(prev, i) || !planted(next, i)) continue;
+        const [a, b] = [world(prev, i), world(next, i)];
+        expect(Math.hypot(a.x - b.x, a.y - b.y), `leg ${i} step ${n}`).toBeLessThan(1e-6);
+        checked++;
+      }
+      prev = next;
+    }
+    expect(checked).toBeGreaterThan(1000);
+    expect(Math.hypot(prev.odom.x, prev.odom.y) + Math.abs(prev.odom.heading)).toBeGreaterThan(1);
+  });
+
+  it('averages cmPerSecAtMax over whole cycles at a full forward stride', () => {
+    const vel = { vx: 0, vy: 3, omega: 0 };
+    const s = run(initGait(), 2 * gaitPeriodMs(vel), vel);
+    expect(s.odom.y).toBeCloseTo((GAIT.cmPerSecAtMax * 2 * gaitPeriodMs(vel)) / 1000, 6);
     expect(s.odom.x).toBeCloseTo(0, 9);
   });
 

@@ -142,7 +142,10 @@ export class SimRobot {
         }
         break;
       case 'balance':
-        // Flat ground: balancing never changes the attitude. Turning it off zeroes the latched att.
+        // Flat ground: balancing never changes the attitude. Turning it off zeroes the latched att
+        // and calls minihexa.move(&vel, &pos, &att) with the latched vel (remote.ino
+        // MINIHEXA_BALANCE). Avoid never touches that vel, so J|0 during avoid replaces the avoid
+        // walk with the last C velocity (standing still if none).
         if (!cmd.on) {
           this.latchedPose = { ...this.latchedPose, pitch: 0, roll: 0, yaw: 0 };
           this.drive(this.latchedVel, this.latchedPose, now, MOVE_MS);
@@ -193,7 +196,9 @@ export class SimRobot {
       const cur = this.poseAt(t0);
       const pos = step.pos === 'keep' ? { x: cur.x, y: cur.y } : step.pos;
       const v = step.vel ?? ZERO_VEL;
-      // Robot::move counts one step per gait period (move_time >= 400).
+      // Robot::move counts one step per gait period, move_time = max(400, moveMs): wake_up walks
+      // 10 steps at 500ms = 5000ms. The sim gait runs at gaitPeriodMs (600ms at vy 1.5), so it
+      // covers ~8.3 cycles in that window rather than 10; the duration matches, the distance not.
       if (step.vel) a.walkUntil = t0 + step.vel.steps * Math.max(400, step.moveMs);
       this.drive({ vx: v.vx, vy: v.vy, omega: v.omega }, { ...cur, ...pos, ...step.att }, t0, step.moveMs);
     }

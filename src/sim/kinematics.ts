@@ -44,11 +44,16 @@ export const LEG_ORIGINS: Vec3[] = [
   { x: -3.15, y: -5.65, z: 0 },
 ];
 
-export const LEG_MOUNT_ANGLE: number[] = LEG_ORIGINS.map((o) => Math.atan2(o.y, o.x));
+/**
+ * Leg frame x-axis direction per leg (radians): the firmware rotates L1..L6 by -45, 0, 45, 135,
+ * 180, -135 degrees (hiwonder_robot.cpp 215-227; inverse rotations in cal_omni_move_end_point
+ * 580-585). Note this is not atan2 of the hip position (about ±61° / ±119° for the corner legs).
+ */
+export const LEG_MOUNT_ANGLE: number[] = [-45, 0, 45, 135, 180, -135].map((d) => (d * Math.PI) / 180);
 
 /**
- * Neutral foot positions in the body frame (body z offset 0). The feet point in the firmware's
- * per-leg directions (-45, 0, 45, 135, 180, -135 degrees; hiwonder_robot.cpp 222-234), but sit a
+ * Neutral foot positions in the body frame (body z offset 0). Each foot lies straight out along
+ * its leg frame x-axis (joint a = 0, as the firmware's r_leg_end; hiwonder_robot.cpp 222-234), but sits a
  * little further out and lower than the firmware default (Leg::start_point = {6.5, 0, -4}):
  * with this IK the firmware stance folds the knee past its limit when a lifted swing foot passes
  * under the hip at body z 0. 7cm / -4.5cm keeps every foot between ~34% and ~95% of the femur +
@@ -56,9 +61,8 @@ export const LEG_MOUNT_ANGLE: number[] = LEG_ORIGINS.map((o) => Math.atan2(o.y, 
  */
 const STANCE_REACH = 7;
 const STANCE_HEIGHT = -4.5;
-const STANCE_DIR_DEG = [-45, 0, 45, 135, 180, -135];
 export const STANCE: Vec3[] = LEG_ORIGINS.map((o, i) => {
-  const d = (STANCE_DIR_DEG[i]! * Math.PI) / 180;
+  const d = LEG_MOUNT_ANGLE[i]!;
   return { x: o.x + STANCE_REACH * Math.cos(d), y: o.y + STANCE_REACH * Math.sin(d), z: STANCE_HEIGHT };
 });
 
