@@ -43,10 +43,10 @@ describe('BleTransport', () => {
     t.send({ kind: 'move', vx: 0, vy: 0, turn: 0 });
     await flush();
     expect(writes).toEqual(['C|0|50|0&']);
-    resolvers[0].ok();
+    resolvers[0]!.ok();
     await flush();
     expect(writes).toEqual(['C|0|50|0&', 'C|0|0|0&']);
-    resolvers[1].ok();
+    resolvers[1]!.ok();
     await flush();
     expect(writes.join('')).toBe('C|0|50|0&C|0|0|0&');
   });
