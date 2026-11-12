@@ -1,6 +1,6 @@
-import { describe, it, expect, vi } from 'vitest';
-import { encodeCommand } from '../../src/protocol/commands';
-import { BleTransport, chunkAscii, type WritableChar } from '../../src/transport/ble';
+import { describe, it, expect, vi, afterEach } from 'vitest';
+import { STOP, encodeCommand, type RobotCommand } from '../../src/protocol/commands';
+import { BleTransport, STOP_CONFIRM_MS, chunkAscii, type WritableChar } from '../../src/transport/ble';
 
 const dec = new TextDecoder();
 const text = (v: BufferSource) =>
@@ -8,7 +8,13 @@ const text = (v: BufferSource) =>
 const flush = () => new Promise((r) => setTimeout(r, 0));
 
 function events() {
-  return { onTelemetry: vi.fn(), onDisconnect: vi.fn(), onError: vi.fn() };
+  return {
+    onTelemetry: vi.fn(),
+    onDisconnect: vi.fn(),
+    onError: vi.fn(),
+    onWritten: vi.fn<(cmd: RobotCommand, ok: boolean) => void>(),
+    onStopTimeout: vi.fn(),
+  };
 }
 function manualChar() {
   const writes: string[] = [];
@@ -154,5 +160,169 @@ describe('BleTransport', () => {
     const s = encodeCommand({ kind: 'move', vx: -50, vy: -50, turn: 0 });
     expect(s).toBe('C|-50|-50|0&');
     expect(chunkAscii(s, 20)).toHaveLength(1);
+  });
+});
+
+const mv = (vx: number, vy: number): RobotCommand => ({ kind: 'move', vx, vy, turn: 0 });
+const pz = (z: number): RobotCommand => ({ kind: 'pose', yaw: 0, pitch: 0, roll: 0, x: 0, y: 0, z });
+
+describe('BleTransport write outcomes', () => {
+  it('reports each written command with ok=true after its last chunk resolves', async () => {
+    const { c, resolvers } = manualChar();
+    const ev = events();
+    const t = new BleTransport(c, ev);
+    t.send(mv(0, 50));
+    await flush();
+    expect(ev.onWritten).not.toHaveBeenCalled();
+    resolvers[0]!.ok();
+    await flush();
+    expect(ev.onWritten).toHaveBeenCalledWith(mv(0, 50), true);
+  });
+
+  it('reports a failed write with ok=false', async () => {
+    const { c, resolvers } = manualChar();
+    const ev = events();
+    const t = new BleTransport(c, ev);
+    t.send(STOP);
+    await flush();
+    resolvers[0]!.fail(new Error('gatt'));
+    await flush();
+    expect(ev.onWritten).toHaveBeenCalledWith(STOP, false);
+    expect(ev.onError).toHaveBeenCalledTimes(1);
+  });
+
+  it('a command in flight at disconnect is reported unconfirmed before onDisconnect; pending ones are dropped', async () => {
+    const { c, writes, resolvers } = manualChar();
+    const order: string[] = [];
+    const ev = events();
+    ev.onWritten.mockImplementation((cmd, ok) => order.push(`${cmd.kind}:${ok}`));
+    ev.onDisconnect.mockImplementation(() => order.push('disconnect'));
+    const t = new BleTransport(c, ev);
+    t.send(mv(0, 50));
+    t.send({ kind: 'led', r: 1, g: 2, b: 3 });
+    await flush();
+    t.handleDisconnected();
+    expect(order).toEqual(['move:false', 'disconnect']);
+    resolvers[0]!.ok(); // settles late: must not be reported again
+    await flush();
+    expect(order).toEqual(['move:false', 'disconnect']);
+    expect(writes).toEqual(['C|0|50|0&']);
+  });
+});
+
+describe('BleTransport pending queue coalescing', () => {
+  /** Put a LED in flight so later sends stay pending, then release everything in order. */
+  async function run(cmds: RobotCommand[]): Promise<string[]> {
+    const { c, writes, resolvers } = manualChar();
+    const t = new BleTransport(c, events());
+    t.send({ kind: 'led', r: 0, g: 0, b: 0 });
+    await flush();
+    for (const cmd of cmds) t.send(cmd);
+    for (let i = 0; i < 20; i++) {
+      resolvers[i]?.ok();
+      await flush();
+    }
+    return writes.slice(1);
+  }
+
+  it('a newer move replaces a pending move', async () => {
+    expect(await run([mv(0, 10), mv(0, 20), mv(0, 30)])).toEqual(['C|0|30|0&']);
+  });
+
+  it('a newer pose replaces a pending pose', async () => {
+    expect(await run([pz(5), pz(6), pz(7)])).toEqual(['F|0|0|0|0|0|7&']);
+  });
+
+  it('only one write is in flight at a time and the pending queue stays bounded', async () => {
+    const { c, writes } = manualChar();
+    const t = new BleTransport(c, events());
+    for (let i = 0; i < 1000; i++) {
+      t.send(mv(0, (i % 50) + 1));
+      t.send(pz(i % 30));
+    }
+    await flush();
+    expect(writes).toHaveLength(1);
+    expect(t.pendingCount).toBeLessThanOrEqual(2);
+  });
+
+  it('STOP drops pending moves and poses', async () => {
+    expect(await run([mv(0, 10), pz(5), STOP])).toEqual(['C|0|0|0&']);
+  });
+
+  it('avoid-off and balance-off drop pending moves and poses but keep a pending STOP', async () => {
+    expect(await run([mv(0, 10), pz(5), { kind: 'avoid', on: false }])).toEqual(['I|0&']);
+    expect(await run([pz(5), { kind: 'balance', on: false }])).toEqual(['J|0&']);
+    expect(await run([STOP, { kind: 'avoid', on: false }])).toEqual(['C|0|0|0&', 'I|0&']);
+  });
+
+  it('non-coalescable commands keep their order', async () => {
+    const out = await run([
+      { kind: 'action', id: 3 },
+      { kind: 'avoid', on: true },
+      { kind: 'balance', on: true },
+      { kind: 'reset' },
+      { kind: 'led', r: 1, g: 1, b: 1 },
+      { kind: 'led', r: 2, g: 2, b: 2 },
+    ]);
+    expect(out).toEqual(['K|1|3&', 'I|1&', 'J|1&', 'O&', 'H|1|1|1&', 'H|2|2|2&']);
+  });
+
+  it('a coalesced move goes to the back, after commands queued before it', async () => {
+    expect(await run([mv(0, 10), { kind: 'reset' }, mv(0, 20)])).toEqual(['O&', 'C|0|20|0&']);
+  });
+});
+
+describe('BleTransport STOP confirmation timeout', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it(`reports a STOP not confirmed within ${STOP_CONFIRM_MS}ms`, async () => {
+    vi.useFakeTimers();
+    const { c } = manualChar(); // writes never resolve
+    const ev = events();
+    const t = new BleTransport(c, ev);
+    t.send(mv(0, 50));
+    t.send(STOP);
+    await vi.advanceTimersByTimeAsync(STOP_CONFIRM_MS - 1);
+    expect(ev.onStopTimeout).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(ev.onStopTimeout).toHaveBeenCalledTimes(1);
+  });
+
+  it('a STOP confirmed in time is not reported', async () => {
+    vi.useFakeTimers();
+    const { c, resolvers } = manualChar();
+    const ev = events();
+    const t = new BleTransport(c, ev);
+    t.send(STOP);
+    await vi.advanceTimersByTimeAsync(100);
+    resolvers[0]!.ok();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(ev.onStopTimeout).not.toHaveBeenCalled();
+    expect(ev.onWritten).toHaveBeenCalledWith(STOP, true);
+  });
+
+  it('the timeout runs from the first unconfirmed STOP even if more STOPs follow', async () => {
+    vi.useFakeTimers();
+    const { c } = manualChar();
+    const ev = events();
+    const t = new BleTransport(c, ev);
+    t.send(STOP);
+    await vi.advanceTimersByTimeAsync(200);
+    t.send(STOP);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(ev.onStopTimeout).toHaveBeenCalledTimes(1);
+  });
+
+  it('no timeout report after disconnect', async () => {
+    vi.useFakeTimers();
+    const { c } = manualChar();
+    const ev = events();
+    const t = new BleTransport(c, ev);
+    t.send(STOP);
+    t.handleDisconnected();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(ev.onStopTimeout).not.toHaveBeenCalled();
   });
 });

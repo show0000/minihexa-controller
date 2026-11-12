@@ -33,10 +33,7 @@ const NEUTRAL = readControls({ axes: [], buttons: [] }, emptyMapping());
 let notice: string | null = null;
 
 function send(cmds: RobotCommand[]): void {
-  for (const c of cmds) {
-    fanout.send(c);
-    link.noteSent(c);
-  }
+  for (const c of cmds) fanout.send(c);
 }
 
 function applyMapping(m: Mapping): void {
@@ -57,9 +54,10 @@ el('estop').addEventListener('click', () => send(controller.estop(performance.no
 el('bind').addEventListener('click', openWizard);
 el('connect').addEventListener('click', () => {
   if (link.state === 'connected') {
+    // E-stop through the controller first; disconnect() then waits for a confirmed STOP.
     send(controller.estop(performance.now()));
-    setTimeout(() => link.disconnect(), 300); // let the queued STOP go out first
-  } else {
+    void link.disconnect();
+  } else if (link.state === 'disconnected') {
     void link.connect();
   }
 });

@@ -7,6 +7,7 @@ import {
   type Telemetry,
 } from '../protocol/commands';
 import type { Transport } from './types';
+import { enqueue, isStop } from './writeQueue';
 
 export type { Transport } from './types';
 
@@ -14,7 +15,19 @@ export interface BleEvents {
   onTelemetry(t: Telemetry): void;
   onDisconnect(): void;
   onError(e: unknown): void;
+  /**
+   * Outcome of one command write. ok=false: the write failed, or the link dropped while it
+   * was in flight (reported before onDisconnect), so the robot may or may not have it.
+   * Commands still pending at a disconnect, or replaced while pending, are never written
+   * and never reported.
+   */
+  onWritten(cmd: RobotCommand, ok: boolean): void;
+  /** A STOP was queued but no STOP write succeeded within STOP_CONFIRM_MS. */
+  onStopTimeout(): void;
 }
+
+/** How long a queued STOP may stay unconfirmed before it is reported. */
+export const STOP_CONFIRM_MS = 300;
 
 export interface WritableChar {
   writeValueWithResponse(v: BufferSource): Promise<void>;
@@ -30,7 +43,10 @@ export function chunkAscii(s: string, size: number): string[] {
 
 export class BleTransport implements Transport {
   private _connected = true;
-  private tail: Promise<void> = Promise.resolve();
+  /** One write in flight at a time; later commands wait (coalesced) in `pending`. */
+  private inFlight: RobotCommand | null = null;
+  private pending: RobotCommand[] = [];
+  private stopTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly encoder = new TextEncoder();
   private readonly decoder = new TextDecoder();
   private dirty = false;
@@ -69,43 +85,89 @@ export class BleTransport implements Transport {
     return this._connected;
   }
 
-  send(cmd: RobotCommand): void {
-    if (!this._connected) return;
-    this.tail = this.tail.then(() => this.write(cmd));
+  /** Commands waiting behind the write in flight (for tests and diagnostics). */
+  get pendingCount(): number {
+    return this.pending.length;
   }
 
-  private async write(cmd: RobotCommand): Promise<void> {
+  send(cmd: RobotCommand): void {
     if (!this._connected) return;
-    try {
-      if (this.dirty) {
-        // A previous command failed mid-way; the firmware still holds its
-        // fragment until it sees '&'. Terminate it so it cannot merge with
-        // this command (the garbage fragment is then parsed and discarded).
-        await this.writeChar.writeValueWithResponse(this.encoder.encode('&'));
-        this.dirty = false;
+    this.pending = enqueue(this.pending, cmd);
+    if (isStop(cmd)) this.armStopTimer();
+    else if (!this.stopOutstanding()) this.clearStopTimer(); // a newer move replaced the STOP
+    void this.pump();
+  }
+
+  private stopOutstanding(): boolean {
+    return (this.inFlight !== null && isStop(this.inFlight)) || this.pending.some(isStop);
+  }
+
+  private armStopTimer(): void {
+    if (this.stopTimer !== null) return; // measured from the first unconfirmed STOP
+    this.stopTimer = setTimeout(() => {
+      this.stopTimer = null;
+      if (this._connected) this.call(() => this.events.onStopTimeout());
+    }, STOP_CONFIRM_MS);
+  }
+
+  private clearStopTimer(): void {
+    if (this.stopTimer === null) return;
+    clearTimeout(this.stopTimer);
+    this.stopTimer = null;
+  }
+
+  private async pump(): Promise<void> {
+    if (this.inFlight) return;
+    while (this._connected) {
+      const cmd = this.pending.shift();
+      if (!cmd) return;
+      this.inFlight = cmd;
+      let ok = false;
+      let error: unknown = null;
+      try {
+        await this.write(cmd);
+        ok = true;
+      } catch (e) {
+        error = e;
       }
-      const chunks = chunkAscii(encodeCommand(cmd), MAX_CHUNK);
-      for (let i = 0; i < chunks.length; i++) {
-        if (!this._connected) return;
-        try {
-          await this.writeChar.writeValueWithResponse(this.encoder.encode(chunks[i]!));
-        } catch (e) {
-          // If an earlier chunk of this command was written, the firmware
-          // holds an unterminated fragment: flush it before the next command.
-          if (i > 0) this.dirty = true;
-          throw e;
-        }
-      }
-    } catch (e) {
-      this.report(e);
+      // A disconnect while in flight has already reported this command.
+      if (this.inFlight !== cmd) return;
+      this.inFlight = null;
+      if (!ok) this.call(() => this.events.onError(error));
+      if (ok && isStop(cmd)) this.clearStopTimer();
+      this.call(() => this.events.onWritten(cmd, ok));
     }
   }
 
-  private report(e: unknown): void {
+  /** Write one command; throws if any chunk fails or the link drops. */
+  private async write(cmd: RobotCommand): Promise<void> {
+    if (this.dirty) {
+      // A previous command failed mid-way; the firmware still holds its
+      // fragment until it sees '&'. Terminate it so it cannot merge with
+      // this command (the garbage fragment is then parsed and discarded).
+      await this.writeChar.writeValueWithResponse(this.encoder.encode('&'));
+      this.dirty = false;
+    }
+    const chunks = chunkAscii(encodeCommand(cmd), MAX_CHUNK);
+    for (let i = 0; i < chunks.length; i++) {
+      if (!this._connected) throw new Error('disconnected');
+      try {
+        await this.writeChar.writeValueWithResponse(this.encoder.encode(chunks[i]!));
+      } catch (e) {
+        // If an earlier chunk of this command was written, the firmware
+        // holds an unterminated fragment: flush it before the next command.
+        if (i > 0) this.dirty = true;
+        throw e;
+      }
+    }
+  }
+
+  /** Event handlers must never break the write loop or produce an unhandled rejection. */
+  private call(f: () => void): void {
     try {
-      this.events.onError(e);
-    } catch {
-      // onError must never produce an unhandled rejection.
+      f();
+    } catch (e) {
+      console.error('BLE event handler failed', e);
     }
   }
 
@@ -117,6 +179,11 @@ export class BleTransport implements Transport {
   handleDisconnected(): void {
     if (!this._connected) return;
     this._connected = false;
+    this.clearStopTimer();
+    this.pending = [];
+    const lost = this.inFlight;
+    this.inFlight = null;
+    if (lost) this.call(() => this.events.onWritten(lost, false));
     this.events.onDisconnect();
   }
 

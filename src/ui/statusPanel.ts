@@ -17,6 +17,7 @@ const LINK_TEXT: Record<LinkState, string> = {
   disconnected: '연결 안 됨 (시뮬레이터만)',
   connecting: '연결 중…',
   connected: '연결됨',
+  disconnecting: '정지 확인 후 연결 끊는 중…',
 };
 
 const MODE_TEXT: Record<ControllerMode, string> = {
@@ -74,7 +75,7 @@ export function createStatusPanel(): { update(s: PanelState): void } {
       setBanner(warning, s.warning);
       setBanner(notice, s.notice);
       setText(connectBtn, s.link === 'connected' ? '연결 끊기' : '로봇 연결');
-      connectBtn.disabled = s.link === 'connecting';
+      connectBtn.disabled = s.link === 'connecting' || s.link === 'disconnecting';
     },
   };
 }
