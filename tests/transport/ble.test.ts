@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
+import { encodeCommand } from '../../src/protocol/commands';
 import { BleTransport, chunkAscii, type WritableChar } from '../../src/transport/ble';
 
 const dec = new TextDecoder();
@@ -108,5 +109,50 @@ describe('BleTransport', () => {
     expect(() => t.send({ kind: 'reset' })).not.toThrow();
     await flush();
     expect(writes).toEqual([]);
+  });
+
+  it('flushes a stale fragment with a lone & before the next command', async () => {
+    const stream: string[] = [];
+    let n = 0;
+    const c: WritableChar = {
+      async writeValueWithResponse(v) {
+        n++;
+        if (n === 2) throw new Error('chunk2'); // pose chunk 2 fails
+        stream.push(text(v));
+      },
+    };
+    const onError = vi.fn();
+    const t = new BleTransport(c, { ...events(), onError });
+    t.send({ kind: 'pose', yaw: -50, pitch: -50, roll: -50, x: -50, y: -50, z: 30 });
+    await flush();
+    expect(onError).toHaveBeenCalledTimes(1);
+    stream.length = 0;
+    t.send({ kind: 'move', vx: 0, vy: 0, turn: 0 });
+    await flush();
+    expect(stream.join('')).toBe('&C|0|0|0&');
+  });
+
+  it('failure on chunk 1 does not trigger a flush', async () => {
+    const stream: string[] = [];
+    let n = 0;
+    const c: WritableChar = {
+      async writeValueWithResponse(v) {
+        n++;
+        if (n === 1) throw new Error('chunk1');
+        stream.push(text(v));
+      },
+    };
+    const t = new BleTransport(c, events());
+    t.send({ kind: 'pose', yaw: -50, pitch: -50, roll: -50, x: -50, y: -50, z: 30 });
+    await flush();
+    t.send({ kind: 'move', vx: 0, vy: 0, turn: 0 });
+    await flush();
+    expect(stream.join('')).toBe('C|0|0|0&');
+  });
+
+  it('worst-case move command is a single chunk', () => {
+    const s = encodeCommand({ kind: 'move', vx: -50, vy: -50, turn: 0 });
+    expect(s).toBe('C|-50|-50|0&');
+    expect(chunkAscii(s, 20)).toHaveLength(1);
   });
 });

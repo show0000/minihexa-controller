@@ -33,6 +33,7 @@ export class BleTransport implements Transport {
   private tail: Promise<void> = Promise.resolve();
   private readonly encoder = new TextEncoder();
   private readonly decoder = new TextDecoder();
+  private dirty = false;
   private gatt: BluetoothRemoteGATTServer | null = null;
 
   constructor(
@@ -46,17 +47,22 @@ export class BleTransport implements Transport {
       optionalServices: [BLE_UUIDS.service],
     });
     const server = await device.gatt!.connect();
-    const service = await server.getPrimaryService(BLE_UUIDS.service);
-    const writeChar = await service.getCharacteristic(BLE_UUIDS.write);
-    const notifyChar = await service.getCharacteristic(BLE_UUIDS.notify);
-    const t = new BleTransport(writeChar, events);
-    t.gatt = server;
-    device.addEventListener('gattserverdisconnected', () => t.handleDisconnected());
-    notifyChar.addEventListener('characteristicvaluechanged', () => {
-      if (notifyChar.value) t.handleNotification(notifyChar.value);
-    });
-    await notifyChar.startNotifications();
-    return t;
+    try {
+      const service = await server.getPrimaryService(BLE_UUIDS.service);
+      const writeChar = await service.getCharacteristic(BLE_UUIDS.write);
+      const notifyChar = await service.getCharacteristic(BLE_UUIDS.notify);
+      const t = new BleTransport(writeChar, events);
+      t.gatt = server;
+      device.addEventListener('gattserverdisconnected', () => t.handleDisconnected());
+      notifyChar.addEventListener('characteristicvaluechanged', () => {
+        if (notifyChar.value) t.handleNotification(notifyChar.value);
+      });
+      await notifyChar.startNotifications();
+      return t;
+    } catch (e) {
+      server.disconnect();
+      throw e;
+    }
   }
 
   get connected(): boolean {
@@ -71,13 +77,26 @@ export class BleTransport implements Transport {
   private async write(cmd: RobotCommand): Promise<void> {
     if (!this._connected) return;
     try {
-      for (const chunk of chunkAscii(encodeCommand(cmd), MAX_CHUNK)) {
+      if (this.dirty) {
+        // A previous command failed mid-way; the firmware still holds its
+        // fragment until it sees '&'. Terminate it so it cannot merge with
+        // this command (the garbage fragment is then parsed and discarded).
+        await this.writeChar.writeValueWithResponse(this.encoder.encode('&'));
+        this.dirty = false;
+      }
+      const chunks = chunkAscii(encodeCommand(cmd), MAX_CHUNK);
+      for (let i = 0; i < chunks.length; i++) {
         if (!this._connected) return;
-        await this.writeChar.writeValueWithResponse(this.encoder.encode(chunk));
+        try {
+          await this.writeChar.writeValueWithResponse(this.encoder.encode(chunks[i]!));
+        } catch (e) {
+          // If an earlier chunk of this command was written, the firmware
+          // holds an unterminated fragment: flush it before the next command.
+          if (i > 0) this.dirty = true;
+          throw e;
+        }
       }
     } catch (e) {
-      // Remaining chunks of this command are dropped so a partial command
-      // never gets glued to the next one in the firmware buffer.
       this.report(e);
     }
   }
