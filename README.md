@@ -2,7 +2,7 @@
 
 Hiwonder miniHexa 헥사포드 로봇을 Web Bluetooth와 게임패드로 조종하는 Chrome 웹 앱입니다. 3D 시뮬레이터가 내장되어 있어 로봇 없이도 조작을 확인할 수 있습니다.
 
-- 사용 주소: https://show0000.github.io/minihexa-controller/
+- 사용 주소: https://minihexa.juheejin.com/
 
 ## 요구 사항
 
