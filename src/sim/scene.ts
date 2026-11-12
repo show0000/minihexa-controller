@@ -1,99 +1,64 @@
 /**
- * three.js view of the simulated miniHexa.
- *
- * Everything robot-related lives in a z-up group (`world`) that uses the kinematics frames
- * directly (+x right, +y forward, +z up, cm); the group is rotated so z-up maps to three's y-up.
+ * three.js scene for the simulator: renderer, camera, lights and ground. The robot model is in
+ * robotMesh.ts. Robot and ground live in a z-up group (`world`, kinematics frames, cm) that is
+ * rotated so z-up maps to three's y-up.
  */
 import * as THREE from 'three';
-import { LEG_MOUNT_ANGLE, LEG_ORIGINS, LINK, STANCE, type JointAngles } from './kinematics';
+import { STANCE } from './kinematics';
+import { createRobotMesh } from './robotMesh';
 import type { SimFrame } from './robotModel';
 
-const BODY = { w: 7.6, l: 14, h: 2.4 };
-const GROUND_Z = STANCE[0]!.z;
+/** Foot-tip spheres have a 0.38cm radius; drop the ground so they rest on it. */
+const GROUND_Z = STANCE[0]!.z - 0.38;
 const GRID_CELL = 10;
-const GRID_SIZE = 400;
-const DEG = Math.PI / 180;
-const CAMERA_OFFSET = new THREE.Vector3(22, 30, 40); // three's frame: behind, above and right of the start heading
-const UP = new THREE.Vector3(0, 1, 0);
-
-/** Leg chain points (hip, coxa end, knee, foot) in the leg frame. */
-function legPoints(j: JointAngles): THREE.Vector3[] {
-  const { l1, l2, l3 } = LINK;
-  const ca = Math.cos(j.a);
-  const sa = Math.sin(j.a);
-  const at = (r: number, z: number) => new THREE.Vector3(r * ca, r * sa, z);
-  const r2 = l1 + l2 * Math.cos(j.b);
-  const z2 = l2 * Math.sin(j.b);
-  return [at(0, 0), at(l1, 0), at(r2, z2), at(r2 + l3 * Math.cos(j.b - j.c), z2 + l3 * Math.sin(j.b - j.c))];
-}
-
-function placeSegment(mesh: THREE.Mesh, a: THREE.Vector3, b: THREE.Vector3): void {
-  const d = b.clone().sub(a);
-  const len = d.length();
-  mesh.position.copy(a).addScaledVector(d, 0.5);
-  mesh.scale.set(1, Math.max(len, 1e-3), 1);
-  if (len > 1e-6) mesh.quaternion.setFromUnitVectors(UP, d.divideScalar(len));
-}
+const GROUND_SIZE = 600;
+/** Three's frame (y up, robot starts facing -z): 3/4 front view from slightly above. */
+const CAMERA_OFFSET = new THREE.Vector3(27, 23, -41);
+const LOOK_OFFSET = new THREE.Vector3(0, -1, 0);
 
 export function createScene(canvas: HTMLCanvasElement): { render(f: SimFrame): void; resize(): void } {
   const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-  const scene = new THREE.Scene();
-  scene.background = new THREE.Color(0x1d2228);
-  const camera = new THREE.PerspectiveCamera(45, 1, 0.5, 2000);
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFShadowMap;
 
-  scene.add(new THREE.HemisphereLight(0xffffff, 0x334455, 1.6));
-  const sun = new THREE.DirectionalLight(0xffffff, 1.8);
-  sun.position.set(30, 60, 20);
-  scene.add(sun);
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0xc9cdd2);
+  scene.fog = new THREE.Fog(0xc9cdd2, 120, 320);
+  const camera = new THREE.PerspectiveCamera(40, 1, 0.5, 2000);
+
+  // Key (casts the only shadow), fill and rim light so the black robot reads on screen.
+  scene.add(new THREE.HemisphereLight(0xf2f4f7, 0x6b7076, 1.1));
+  const key = new THREE.DirectionalLight(0xfff6ea, 2.4);
+  key.castShadow = true;
+  key.shadow.mapSize.set(1024, 1024);
+  Object.assign(key.shadow.camera, { left: -25, right: 25, top: 25, bottom: -25, near: 1, far: 120 });
+  key.shadow.radius = 4;
+  scene.add(key, key.target);
+  const fill = new THREE.DirectionalLight(0xdbe6ff, 0.9);
+  scene.add(fill, fill.target);
+  const rim = new THREE.DirectionalLight(0xffffff, 2.2);
+  scene.add(rim, rim.target);
 
   const world = new THREE.Group();
   world.rotation.x = -Math.PI / 2; // z-up -> y-up
   scene.add(world);
 
-  const grid = new THREE.GridHelper(GRID_SIZE, GRID_SIZE / GRID_CELL, 0x5a6672, 0x39424c);
+  const ground = new THREE.Mesh(
+    new THREE.PlaneGeometry(GROUND_SIZE, GROUND_SIZE),
+    new THREE.MeshStandardMaterial({ color: 0xa3a8ae, roughness: 0.95 }),
+  );
+  ground.receiveShadow = true;
+  ground.position.z = GROUND_Z;
+  world.add(ground);
+
+  const grid = new THREE.GridHelper(GROUND_SIZE, GROUND_SIZE / GRID_CELL, 0x80868d, 0x8f959b);
   grid.rotation.x = Math.PI / 2; // GridHelper lies in its xz plane; ours is xy
-  grid.position.z = GROUND_Z;
+  grid.position.z = GROUND_Z + 0.02;
   world.add(grid);
 
-  /** Odometry: world position and heading. */
-  const odomGroup = new THREE.Group();
-  world.add(odomGroup);
-  /** Body pose relative to the neutral stance. */
-  const bodyGroup = new THREE.Group();
-  odomGroup.add(bodyGroup);
-
-  const bodyMesh = new THREE.Mesh(
-    new THREE.BoxGeometry(BODY.w, BODY.l, BODY.h),
-    new THREE.MeshStandardMaterial({ color: 0x3b82c4, roughness: 0.6 }),
-  );
-  bodyGroup.add(bodyMesh);
-  const nose = new THREE.Mesh(
-    new THREE.BoxGeometry(3, 1, 0.6),
-    new THREE.MeshStandardMaterial({ color: 0xe8edf2 }),
-  );
-  nose.position.set(0, BODY.l / 2 - 0.6, BODY.h / 2 + 0.3);
-  bodyGroup.add(nose);
-
-  const ledMat = new THREE.MeshStandardMaterial({ color: 0x00edb2, emissive: 0x00edb2, emissiveIntensity: 0.8 });
-  const led = new THREE.Mesh(new THREE.SphereGeometry(0.9, 20, 14), ledMat);
-  led.position.set(0, -BODY.l / 2 + 2, BODY.h / 2 + 0.6);
-  bodyGroup.add(led);
-
-  const legMat = new THREE.MeshStandardMaterial({ color: 0xc9d1d9, roughness: 0.5 });
-  const radii = [0.55, 0.45, 0.35];
-  const legs = LEG_ORIGINS.map((o, i) => {
-    const g = new THREE.Group();
-    g.position.set(o.x, o.y, o.z);
-    g.rotation.z = LEG_MOUNT_ANGLE[i]!;
-    bodyGroup.add(g);
-    const segs = radii.map((r) => {
-      const m = new THREE.Mesh(new THREE.CylinderGeometry(r, r, 1, 12), legMat);
-      g.add(m);
-      return m;
-    });
-    return segs;
-  });
+  const robot = createRobotMesh();
+  world.add(robot.group);
 
   const robotPos = new THREE.Vector3();
 
@@ -106,31 +71,25 @@ export function createScene(canvas: HTMLCanvasElement): { render(f: SimFrame): v
   }
 
   function render(f: SimFrame): void {
-    odomGroup.position.set(f.odom.x, f.odom.y, 0);
-    odomGroup.rotation.z = f.odom.heading;
-    bodyGroup.position.set(f.body.x, f.body.y, f.body.z);
-    // kinematics rotation(): R = Rz(yaw) * Rx(pitch) * Ry(roll) -> three Euler order 'ZXY'
-    bodyGroup.rotation.set(f.body.pitch * DEG, f.body.roll * DEG, f.body.yaw * DEG, 'ZXY');
+    robot.update(f);
 
-    f.joints.forEach((j, i) => {
-      const segs = legs[i];
-      if (!segs) return;
-      const p = legPoints(j);
-      segs.forEach((m, k) => placeSegment(m, p[k]!, p[k + 1]!));
-    });
-
-    const [r, g, b] = f.led;
-    ledMat.color.setRGB(r / 255, g / 255, b / 255, THREE.SRGBColorSpace);
-    ledMat.emissive.copy(ledMat.color);
-
-    // Keep the finite grid under the robot.
-    grid.position.x = Math.round(f.odom.x / GRID_CELL) * GRID_CELL;
-    grid.position.y = Math.round(f.odom.y / GRID_CELL) * GRID_CELL;
+    // Keep the finite ground under the robot.
+    const gx = Math.round(f.odom.x / GRID_CELL) * GRID_CELL;
+    const gy = Math.round(f.odom.y / GRID_CELL) * GRID_CELL;
+    ground.position.set(gx, gy, GROUND_Z);
+    grid.position.set(gx, gy, GROUND_Z + 0.02);
 
     world.updateMatrixWorld();
-    odomGroup.getWorldPosition(robotPos);
+    robot.group.getWorldPosition(robotPos);
     camera.position.copy(robotPos).add(CAMERA_OFFSET);
-    camera.lookAt(robotPos);
+    camera.lookAt(robotPos.clone().add(LOOK_OFFSET));
+
+    // Lights travel with the robot so the shadow map stays small and sharp.
+    key.position.copy(robotPos).add(new THREE.Vector3(18, 40, -12));
+    fill.position.copy(robotPos).add(new THREE.Vector3(-30, 15, -20));
+    rim.position.copy(robotPos).add(new THREE.Vector3(-10, 25, 35));
+    for (const l of [key, fill, rim]) l.target.position.copy(robotPos);
+
     renderer.render(scene, camera);
   }
 
