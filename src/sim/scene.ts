@@ -12,9 +12,15 @@ import type { SimFrame } from './robotModel';
 const GROUND_Z = STANCE[0]!.z - 0.38;
 const GRID_CELL = 10;
 const GROUND_SIZE = 600;
-/** Three's frame (y up, robot starts facing -z): 3/4 front view from slightly above. */
-const CAMERA_OFFSET = new THREE.Vector3(27, 23, -41);
-const LOOK_OFFSET = new THREE.Vector3(0, -1, 0);
+/** Chase camera in the robot's heading frame (z-up, cm): behind (-y), a little right, above. */
+const CHASE = { back: 44, right: 8, up: 24 };
+/** Time constant of the camera's heading smoothing (ms). */
+const HEADING_TAU_MS = 250;
+
+/** Shortest signed angle from a to b. */
+function angleDelta(a: number, b: number): number {
+  return Math.atan2(Math.sin(b - a), Math.cos(b - a));
+}
 
 export function createScene(canvas: HTMLCanvasElement): { render(f: SimFrame): void; resize(): void } {
   const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
@@ -61,6 +67,10 @@ export function createScene(canvas: HTMLCanvasElement): { render(f: SimFrame): v
   world.add(robot.group);
 
   const robotPos = new THREE.Vector3();
+  const lookAt = new THREE.Vector3();
+  const camLocal = new THREE.Vector3();
+  let camHeading: number | null = null;
+  let lastRenderAt: number | null = null;
 
   function resize(): void {
     const w = canvas.clientWidth || 1;
@@ -81,8 +91,23 @@ export function createScene(canvas: HTMLCanvasElement): { render(f: SimFrame): v
 
     world.updateMatrixWorld();
     robot.group.getWorldPosition(robotPos);
-    camera.position.copy(robotPos).add(CAMERA_OFFSET);
-    camera.lookAt(robotPos.clone().add(LOOK_OFFSET));
+    // Chase camera: follows the odometry heading with gentle smoothing, so driving forward
+    // moves the robot away from the viewer.
+    const t = performance.now();
+    const dt = lastRenderAt === null ? 0 : Math.min(200, t - lastRenderAt);
+    lastRenderAt = t;
+    const h = f.odom.heading;
+    camHeading = camHeading === null ? h : camHeading + angleDelta(camHeading, h) * (1 - Math.exp(-dt / HEADING_TAU_MS));
+    const fwd = { x: -Math.sin(camHeading), y: Math.cos(camHeading) }; // heading 0 faces +y, CCW
+    const right = { x: fwd.y, y: -fwd.x };
+    camLocal.set(
+      f.odom.x - fwd.x * CHASE.back + right.x * CHASE.right,
+      f.odom.y - fwd.y * CHASE.back + right.y * CHASE.right,
+      CHASE.up,
+    );
+    camera.position.copy(world.localToWorld(camLocal));
+    lookAt.copy(world.localToWorld(camLocal.set(f.odom.x + fwd.x * 4, f.odom.y + fwd.y * 4, -1)));
+    camera.lookAt(lookAt);
 
     // Lights travel with the robot so the shadow map stays small and sharp.
     key.position.copy(robotPos).add(new THREE.Vector3(18, 40, -12));

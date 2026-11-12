@@ -56,6 +56,7 @@ export function createStatusPanel(): { update(s: PanelState): void } {
   const mode = el('st-mode');
   const height = el('st-height');
   const lock = el('st-lock');
+  const latch = el('st-latch');
   const warning = el('warning');
   const notice = el('notice');
   const connectBtn = el<HTMLButtonElement>('connect');
@@ -69,6 +70,7 @@ export function createStatusPanel(): { update(s: PanelState): void } {
       setText(mode, MODE_TEXT[s.status.mode]);
       setText(height, `${Math.round(s.status.z)} / 30`);
       setBanner(lock, lockText(s.status, s.now));
+      latch.hidden = !s.status.stickLatched;
       setBanner(warning, s.warning);
       setBanner(notice, s.notice);
       setText(connectBtn, s.link === 'connected' ? '연결 끊기' : '로봇 연결');

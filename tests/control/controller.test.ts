@@ -485,3 +485,58 @@ describe('Controller: STOP slot occupancy and redundancy', () => {
     expect(c.update(ends, N)).toEqual([pose(0, 0)]);
   });
 });
+
+describe('Controller: Task 6 UI hooks', () => {
+  it('setActionIds changes the action sent and keeps height belief and mode', () => {
+    const c = mk();
+    // raise the body for 1s (heightUp at 15/s from DEFAULT_Z)
+    for (let t = 0; t <= 1000; t += 16) c.update(t, inp({ heightUp: 1 }));
+    const z = c.status().z;
+    expect(z).toBeGreaterThan(DEFAULT_Z + 10);
+    c.update(1100, N);
+    c.setActionIds({ action1: 9, action2: 2, action3: 4, action4: 5 });
+    expect(c.status()).toMatchObject({ mode: 'manual', z });
+    const sent = [...c.update(1200, inp({ action1: 1 })), ...c.update(1300, N)];
+    expect(sent).toContainEqual({ kind: 'action', id: 9 });
+    expect(c.status().mode).toBe('action');
+    expect(c.status().z).toBe(z);
+  });
+
+  it('setActionIds during avoid mode keeps the mode', () => {
+    const c = mk();
+    c.update(0, inp({ avoidToggle: 1 }));
+    expect(c.status().mode).toBe('avoid');
+    c.setActionIds({ action1: 3, action2: 3, action3: 3, action4: 3 });
+    expect(c.status().mode).toBe('avoid');
+  });
+
+  it('setActionIds copies the ids (later mutation of the argument has no effect)', () => {
+    const c = mk();
+    const ids = { action1: 7, action2: 2, action3: 4, action4: 5 };
+    c.setActionIds(ids);
+    ids.action1 = 1;
+    const sent = [...c.update(0, inp({ action1: 1 })), ...c.update(100, N)];
+    expect(sent).toContainEqual({ kind: 'action', id: 7 });
+  });
+
+  it('stickLatched is true after estop until the stick returns to neutral', () => {
+    const c = mk();
+    expect(c.status().stickLatched).toBe(false);
+    c.update(0, inp({ moveY: 1 }));
+    c.estop(10);
+    expect(c.status().stickLatched).toBe(true);
+    c.update(100, inp({ moveY: 1 }));
+    expect(c.status().stickLatched).toBe(true);
+    c.update(200, N);
+    expect(c.status().stickLatched).toBe(false);
+  });
+
+  it('resync stops and re-sends the believed pose on the next free slot', () => {
+    const c = mk();
+    c.update(0, N);
+    expect(c.resync(100)).toEqual([STOP]);
+    const later: RobotCommand[] = [];
+    for (let t = 116; t < 400; t += 16) later.push(...c.update(t, N));
+    expect(later).toContainEqual(pose(0, 0));
+  });
+});

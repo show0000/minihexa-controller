@@ -19,7 +19,7 @@ function el<T extends HTMLElement = HTMLElement>(id: string): T {
 
 const sim = new SimRobot();
 const fanout = new Fanout({ send: (c) => sim.apply(c, performance.now()), connected: true });
-const link = new RobotLink(fanout);
+const link = new RobotLink(fanout, () => send(controller.resync(performance.now())));
 const pads = new PadTracker();
 const panel = createStatusPanel();
 const canvas = el<HTMLCanvasElement>('sim');
@@ -28,12 +28,8 @@ new ResizeObserver(() => scene.resize()).observe(canvas);
 
 const storedMapping = loadMapping();
 let mapping: Mapping = storedMapping ?? emptyMapping();
-let controller = new Controller(mapping.actionIds);
-/** Action ids waiting for the controller to be back in manual mode before it is rebuilt. */
-let pendingActionIds: Mapping['actionIds'] | null = null;
+const controller = new Controller(mapping.actionIds);
 const NEUTRAL = readControls({ axes: [], buttons: [] }, emptyMapping());
-/** Whether a pad was in use on the previous frame (fallback if gamepaddisconnected is missed). */
-let padInUse = false;
 let notice: string | null = null;
 
 function send(cmds: RobotCommand[]): void {
@@ -43,22 +39,10 @@ function send(cmds: RobotCommand[]): void {
   }
 }
 
-function sameIds(a: Mapping['actionIds'], b: Mapping['actionIds']): boolean {
-  return a.action1 === b.action1 && a.action2 === b.action2 && a.action3 === b.action3 && a.action4 === b.action4;
-}
-
 function applyMapping(m: Mapping): void {
-  if (!sameIds(m.actionIds, mapping.actionIds)) pendingActionIds = m.actionIds;
+  controller.setActionIds(m.actionIds);
   mapping = m;
   notice = saveMapping(m) ? null : '브라우저에 매핑을 저장하지 못했습니다. 파일로 내보내 두세요.';
-}
-
-/** The controller holds the action ids; rebuild it only when it is idle in manual mode. */
-function swapControllerIfIdle(): void {
-  const s = controller.status();
-  if (!pendingActionIds || s.mode !== 'manual' || s.estopPending) return;
-  controller = new Controller(pendingActionIds);
-  pendingActionIds = null;
 }
 
 const wizard = createBindingWizard(applyMapping);
@@ -101,8 +85,7 @@ fileInput.addEventListener('change', async () => {
 window.addEventListener('gamepaddisconnected', (e) => {
   if (e.gamepad.index !== pads.index) return;
   send(controller.gamepadLost(performance.now()));
-  pads.index = null;
-  padInUse = false;
+  pads.index = null; // the loop must not report this loss a second time
 });
 // rAF stops in a hidden tab, so these must send directly.
 document.addEventListener('visibilitychange', () => {
@@ -111,10 +94,19 @@ document.addEventListener('visibilitychange', () => {
 window.addEventListener('blur', () => send(controller.hidden(performance.now())));
 
 function frame(): void {
-  const now = performance.now();
-  const gp = pads.current();
-  if (padInUse && !gp) send(controller.gamepadLost(now));
-  padInUse = gp !== null;
+  // Schedule first so one exception cannot stop the loop (and with it every STOP).
+  requestAnimationFrame(frame);
+  try {
+    step(performance.now());
+  } catch (e) {
+    console.error('frame failed', e);
+  }
+}
+
+function step(now: number): void {
+  // Pad gone without an event, or the tracked index changed: treat it as a lost pad.
+  const { pad: gp, lost } = pads.poll();
+  if (lost) send(controller.gamepadLost(now));
   const snap = gp ? snapshot(gp) : null;
 
   let input = NEUTRAL;
@@ -123,7 +115,6 @@ function frame(): void {
   } else if (snap && !document.hidden && document.hasFocus()) {
     input = readControls(snap, mapping);
   }
-  swapControllerIfIdle();
   send(controller.update(now, input));
 
   scene.render(sim.tick(now));
@@ -136,7 +127,6 @@ function frame(): void {
     warning: link.warning,
     notice: [notice, link.notice].filter(Boolean).join(' · ') || null,
   });
-  requestAnimationFrame(frame);
 }
 
 if (!storedMapping) openWizard();

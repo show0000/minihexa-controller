@@ -9,6 +9,8 @@ export interface ControllerStatus {
   actionEndsAt: number | null;
   estopPending: boolean;
   z: number;
+  /** After an e-stop, moves stay suppressed until the move input returns to neutral. */
+  stickLatched: boolean;
 }
 
 export const SEND_INTERVAL_MS = 50;
@@ -83,10 +85,25 @@ export class Controller {
   /** Extra STOPs still to send, one per free slot, in case the firmware dropped one. */
   private stopRepeats = 0;
 
-  constructor(private readonly actionIds: Record<ActionKey, number>) {}
+  private actionIds: Record<ActionKey, number>;
+
+  constructor(actionIds: Record<ActionKey, number>) {
+    this.actionIds = { ...actionIds };
+  }
+
+  /** Change the action ids bound to action1..4. Mode, height and send state are kept. */
+  setActionIds(ids: Record<ActionKey, number>): void {
+    this.actionIds = { ...ids };
+  }
 
   status(): ControllerStatus {
-    return { mode: this.mode, actionEndsAt: this.actionEndsAt, estopPending: this.estopPending, z: this.z };
+    return {
+      mode: this.mode,
+      actionEndsAt: this.actionEndsAt,
+      estopPending: this.estopPending,
+      z: this.z,
+      stickLatched: this.moveLatched,
+    };
   }
 
   update(now: number, input: ControlInput): RobotCommand[] {
@@ -185,6 +202,16 @@ export class Controller {
   hidden(now: number): RobotCommand[] {
     const out = this.halt(now);
     this.prevPressed = null;
+    return out;
+  }
+
+  /**
+   * After a (re)connected robot whose state is unknown: e-stop, and treat the pose as unknown
+   * so the believed pose (height, tilt) is re-sent on the next free slot.
+   */
+  resync(now: number): RobotCommand[] {
+    const out = this.estop(now);
+    this.lastPose = null;
     return out;
   }
 

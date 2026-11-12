@@ -5,8 +5,17 @@ export class PadTracker {
   /** Index of the pad in use; null when none is connected. */
   index: number | null = null;
 
-  /** The pad in use: the tracked one if still connected, else the first connected pad. */
-  current(): Gamepad | null {
+  /**
+   * The pad in use: the tracked one if still connected, else the first connected pad.
+   * `lost` is true when a previously tracked pad is gone or another index took over.
+   */
+  poll(): { pad: Gamepad | null; lost: boolean } {
+    const before = this.index;
+    const pad = this.current();
+    return { pad, lost: before !== null && this.index !== before };
+  }
+
+  private current(): Gamepad | null {
     const pads = navigator.getGamepads ? navigator.getGamepads() : [];
     const tracked = this.index === null ? null : pads[this.index];
     if (tracked && tracked.connected) return tracked;

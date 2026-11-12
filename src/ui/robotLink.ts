@@ -20,7 +20,11 @@ export class RobotLink {
   /** Whether the last walking-related command actually sent to the robot left it walking. */
   private mayWalk = false;
 
-  constructor(private readonly fanout: Fanout) {}
+  /** `onConnected` must bring the robot to a known state through the controller (e.g. resync). */
+  constructor(
+    private readonly fanout: Fanout,
+    private readonly onConnected: () => void,
+  ) {}
 
   async connect(): Promise<void> {
     if (this.state !== 'disconnected') return;
@@ -31,11 +35,15 @@ export class RobotLink {
     this.state = 'connecting';
     this.notice = null;
     try {
-      const t = await BleTransport.connect({
+      let t: BleTransport | null = null;
+      t = await BleTransport.connect({
         onTelemetry: (tel) => {
           this.telemetry = tel;
         },
-        onDisconnect: () => this.handleDisconnect(t),
+        // A disconnect during connect() (before t is assigned) surfaces as a rejected connect.
+        onDisconnect: () => {
+          if (t) this.handleDisconnect(t);
+        },
         onError: (e) => {
           this.notice = `전송 오류: ${errorText(e)}`;
         },
@@ -44,9 +52,9 @@ export class RobotLink {
       this.fanout.setRobot(t);
       this.state = 'connected';
       this.warning = null;
-      // Unknown robot state after (re)connecting: put it in a known one.
-      t.send(STOP);
       this.mayWalk = false;
+      // Unknown robot state after (re)connecting: the controller puts it in a known one.
+      this.onConnected();
     } catch (e) {
       this.state = 'disconnected';
       // NotFoundError: the user closed the device chooser.
